@@ -2,6 +2,7 @@ import type { MemoryBackend } from "./backend.js";
 import { DirectBackend } from "./direct-backend.js";
 import { ServerBackend } from "./server-backend.js";
 import { createEmbedder } from "./embedder.js";
+import { registerHooks } from "./hooks.js";
 import type {
   PluginConfig,
   CreateMemoryInput,
@@ -33,6 +34,7 @@ interface OpenClawPluginApi {
     factory: ToolFactory | (() => AnyAgentTool[]),
     opts: { names: string[] }
   ) => void;
+  on: (hookName: string, handler: (...args: unknown[]) => unknown, opts?: { priority?: number }) => void;
 }
 
 interface ToolContext {
@@ -307,6 +309,7 @@ const mnemoPlugin = {
       api.registerTool(() => tools, {
         names: toolNames,
       });
+      registerHooks(api, backend, api.logger);
       return;
     }
 
@@ -344,6 +347,18 @@ const mnemoPlugin = {
       };
 
       api.registerTool(factory, { names: toolNames });
+
+      // Register hooks with a lazy backend for lifecycle memory management.
+      // Uses the default workspace/agent context for hook-triggered operations.
+      const hookBackend = new LazyServerBackend(
+        cfg.apiUrl!,
+        cfg.userToken!,
+        hashWorkspaceDir("default"),
+        cfg.agentName ?? "agent",
+        spaceTokenCache,
+        "default::" + (cfg.agentName ?? "agent"),
+      );
+      registerHooks(api, hookBackend, api.logger);
       return;
     }
 

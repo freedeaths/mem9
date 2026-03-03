@@ -10,9 +10,22 @@ OpenClaw loads plugin as kind: "memory"
 Plugin replaces built-in memory slot → framework manages lifecycle
      ↓
 5 tools registered: store / search / get / update / delete
+     ↓
+4 lifecycle hooks: auto-recall, auto-capture, compact/reset awareness
 ```
 
-This is a `kind: "memory"` plugin — OpenClaw's framework manages when to load/save memories. The plugin provides 5 tools that the agent (or framework) can invoke:
+This is a `kind: "memory"` plugin — OpenClaw's framework manages when to load/save memories. The plugin provides 5 tools **plus** 4 lifecycle hooks for automatic memory management:
+
+### Lifecycle Hooks (Automatic)
+
+| Hook | Trigger | What it does |
+|---|---|---|
+| `before_prompt_build` | Every LLM call | Searches memories by current prompt, injects relevant ones as context (3-min TTL cache) |
+| `after_compaction` | After `/compact` | Invalidates cache so the next prompt gets fresh memories from the database |
+| `before_reset` | Before `/reset` | Saves a session summary (last 3 user messages) as memory before context is wiped |
+| `agent_end` | Agent finishes | Auto-captures the last assistant response as memory (if substantial) |
+
+### Tools (Agent-Invoked)
 
 | Tool | Description |
 |---|---|
@@ -21,6 +34,8 @@ This is a `kind: "memory"` plugin — OpenClaw's framework manages when to load/
 | `memory_get` | Retrieve a single memory by ID |
 | `memory_update` | Update an existing memory |
 | `memory_delete` | Delete a memory by ID |
+
+**Key improvement**: After `/compact` or `/reset`, the agent no longer "forgets" — lifecycle hooks ensure memories are automatically re-injected into the LLM context on the very next prompt.
 
 ## Prerequisites
 
@@ -217,7 +232,7 @@ openclaw-plugin/
 ├── backend.ts             # MemoryBackend interface
 ├── direct-backend.ts      # Direct mode: @tidbcloud/serverless
 ├── server-backend.ts      # Server mode: fetch → mnemo API
-├── embedder.ts            # OpenAI-compatible embedding provider
+├── hooks.ts              # Lifecycle hooks (auto-recall, auto-capture, compact/reset)
 ├── schema.ts              # Auto schema init with VECTOR column
 └── types.ts               # Shared types (PluginConfig, Memory, etc.)
 ```
