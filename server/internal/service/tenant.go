@@ -4,20 +4,20 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 
 	"github.com/qiffang/mnemos/server/internal/domain"
 	"github.com/qiffang/mnemos/server/internal/repository"
 	"github.com/qiffang/mnemos/server/internal/tenant"
 )
 
-const (
-	tenantMemorySchema = `CREATE TABLE IF NOT EXISTS memories (
+const tenantMemorySchemaBase = `CREATE TABLE IF NOT EXISTS memories (
 	    id              VARCHAR(36)     PRIMARY KEY,
 	    content         TEXT            NOT NULL,
 	    source          VARCHAR(100),
 	    tags            JSON,
 	    metadata        JSON,
-	    embedding       VECTOR(1536)    NULL,
+	    %s
 	    memory_type     VARCHAR(20)     NOT NULL DEFAULT 'pinned',
 	    agent_id        VARCHAR(100)    NULL,
 	    session_id      VARCHAR(100)    NULL,
@@ -34,13 +34,25 @@ const (
 	    INDEX idx_session             (session_id),
 	    INDEX idx_updated             (updated_at)
 	)`
-)
+
+func buildMemorySchema(autoModel string, autoDims int) string {
+	var embeddingCol string
+	if autoModel != "" {
+		dims := strconv.Itoa(autoDims)
+		embeddingCol = `embedding VECTOR(` + dims + `) GENERATED ALWAYS AS (EMBED_TEXT('` + autoModel + `', content)) STORED,`
+	} else {
+		embeddingCol = `embedding VECTOR(1536) NULL,`
+	}
+	return fmt.Sprintf(tenantMemorySchemaBase, embeddingCol)
+}
 
 type TenantService struct {
-	tenants repository.TenantRepo
-	zero    *tenant.ZeroClient
-	pool    *tenant.TenantPool
-	logger  *slog.Logger
+	tenants   repository.TenantRepo
+	zero      *tenant.ZeroClient
+	pool      *tenant.TenantPool
+	logger    *slog.Logger
+	autoModel string
+	autoDims  int
 }
 
 func NewTenantService(
@@ -48,8 +60,17 @@ func NewTenantService(
 	zero *tenant.ZeroClient,
 	pool *tenant.TenantPool,
 	logger *slog.Logger,
+	autoModel string,
+	autoDims int,
 ) *TenantService {
-	return &TenantService{tenants: tenants, zero: zero, pool: pool, logger: logger}
+	return &TenantService{
+		tenants:   tenants,
+		zero:      zero,
+		pool:      pool,
+		logger:    logger,
+		autoModel: autoModel,
+		autoDims:  autoDims,
+	}
 }
 
 // ProvisionResult is the output of Provision.
@@ -151,7 +172,7 @@ func (s *TenantService) initSchema(ctx context.Context, t *domain.Tenant) error 
 	if err != nil {
 		return err
 	}
-	if _, err := db.ExecContext(ctx, tenantMemorySchema); err != nil {
+	if _, err := db.ExecContext(ctx, buildMemorySchema(s.autoModel, s.autoDims)); err != nil {
 		return fmt.Errorf("init tenant schema: memories: %w", err)
 	}
 	return nil

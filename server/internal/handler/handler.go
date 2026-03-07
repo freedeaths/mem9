@@ -30,6 +30,7 @@ type Server struct {
 	embedder   *embed.Embedder
 	llmClient  *llm.Client
 	autoModel  string
+	ftsEnabled bool
 	ingestMode service.IngestMode
 	logger     *slog.Logger
 	svcCache   sync.Map
@@ -43,6 +44,7 @@ func NewServer(
 	embedder *embed.Embedder,
 	llmClient *llm.Client,
 	autoModel string,
+	ftsEnabled bool,
 	ingestMode service.IngestMode,
 	logger *slog.Logger,
 ) *Server {
@@ -53,6 +55,7 @@ func NewServer(
 		embedder:    embedder,
 		llmClient:   llmClient,
 		autoModel:   autoModel,
+		ftsEnabled:  ftsEnabled,
 		ingestMode:  ingestMode,
 		logger:      logger,
 	}
@@ -74,7 +77,7 @@ func (s *Server) resolveServices(auth *domain.AuthInfo) resolvedSvc {
 		if cached, ok := s.svcCache.Load(key); ok {
 			return cached.(resolvedSvc)
 		}
-		memRepo := tidb.NewMemoryRepo(auth.TenantDB, s.autoModel)
+		memRepo := tidb.NewMemoryRepo(auth.TenantDB, s.autoModel, s.ftsEnabled)
 		svc := resolvedSvc{
 			memory: service.NewMemoryService(memRepo, s.embedder, s.autoModel),
 			ingest: service.NewIngestService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),
@@ -86,7 +89,7 @@ func (s *Server) resolveServices(auth *domain.AuthInfo) resolvedSvc {
 	if cached, ok := s.svcCache.Load(key); ok {
 		return cached.(resolvedSvc)
 	}
-	memRepo := tidb.NewMemoryRepo(auth.TenantDB, s.autoModel)
+	memRepo := tidb.NewMemoryRepo(auth.TenantDB, s.autoModel, s.ftsEnabled)
 	svc := resolvedSvc{
 		memory: service.NewMemoryService(memRepo, s.embedder, s.autoModel),
 		ingest: service.NewIngestService(memRepo, s.llmClient, s.embedder, s.autoModel, s.ingestMode),

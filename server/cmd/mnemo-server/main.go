@@ -78,7 +78,7 @@ func main() {
 	if cfg.TiDBZeroEnabled {
 		zeroClient = tenant.NewZeroClient(cfg.TiDBZeroAPIURL)
 	}
-	tenantSvc := service.NewTenantService(tenantRepo, zeroClient, tenantPool, logger)
+	tenantSvc := service.NewTenantService(tenantRepo, zeroClient, tenantPool, logger, cfg.EmbedAutoModel, cfg.EmbedAutoDims)
 
 	// Middleware.
 	tenantMW := middleware.ResolveTenant(tenantRepo, tenantPool)
@@ -87,7 +87,7 @@ func main() {
 	rateMW := rl.Middleware()
 
 	// Handler.
-	srv := handler.NewServer(tenantSvc, uploadTaskRepo, cfg.UploadDir, embedder, llmClient, cfg.EmbedAutoModel, service.IngestMode(cfg.IngestMode), logger)
+	srv := handler.NewServer(tenantSvc, uploadTaskRepo, cfg.UploadDir, embedder, llmClient, cfg.EmbedAutoModel, cfg.FTSEnabled, service.IngestMode(cfg.IngestMode), logger)
 	router := srv.Router(tenantMW, rateMW)
 
 	httpSrv := &http.Server{
@@ -108,6 +108,7 @@ func main() {
 		embedder,
 		llmClient,
 		cfg.EmbedAutoModel,
+		cfg.FTSEnabled,
 		service.IngestMode(cfg.IngestMode),
 		logger,
 	)

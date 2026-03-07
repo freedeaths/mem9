@@ -213,8 +213,7 @@ func newTestToken(tenantID string) *domain.TenantToken {
 	}
 }
 
-// newMemoryRepo creates a MemoryRepo pointing at testDB with no auto-embedding.
-// ensureFTSIndex and probeFTS may fail on plain MySQL — that's fine for integration tests.
+// newMemoryRepo creates a MemoryRepo pointing at testDB with no auto-embedding and FTS disabled.
 func newMemoryRepo() *MemoryRepo {
-	return NewMemoryRepo(testDB, "")
+	return NewMemoryRepo(testDB, "", false)
 }

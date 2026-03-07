@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/qiffang/mnemos/server/internal/domain"
@@ -21,69 +20,13 @@ type MemoryRepo struct {
 	ftsAvailable atomic.Bool
 }
 
-func NewMemoryRepo(db *sql.DB, autoModel string) *MemoryRepo {
+func NewMemoryRepo(db *sql.DB, autoModel string, ftsEnabled bool) *MemoryRepo {
 	r := &MemoryRepo{db: db, autoModel: autoModel}
-	// Run FTS index creation + probe in the background so the first HTTP
-	// request for this tenant is not blocked by DDL or retry loops.
-	go func() {
-		ensureFTSIndex(db)
-		if err := probeFTS(db); err != nil {
-			slog.Error("FTS probe failed — full-text search will be unavailable", "err", err)
-			return
-		}
-		slog.Info("FTS probe succeeded — full-text search is available")
-		r.ftsAvailable.Store(true)
-	}()
+	r.ftsAvailable.Store(ftsEnabled)
+	if ftsEnabled {
+		slog.Info("FTS search enabled via MNEMO_FTS_ENABLED")
+	}
 	return r
-}
-
-// ensureFTSIndex attempts to create the FTS index if it does not yet exist.
-// Duplicate index errors are expected and ignored.
-func ensureFTSIndex(db *sql.DB) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	_, err := db.ExecContext(ctx,
-		`ALTER TABLE memories ADD FULLTEXT INDEX idx_fts_content (content) WITH PARSER MULTILINGUAL ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-	)
-	if err != nil {
-		// Duplicate index is expected; log others at warn level.
-		if !strings.Contains(err.Error(), "Duplicate") && !strings.Contains(err.Error(), "1061") {
-			slog.Warn("ensureFTSIndex: non-duplicate error", "err", err)
-		}
-	} else {
-		slog.Info("ensureFTSIndex: FTS index created successfully")
-	}
-}
-
-func probeFTS(db *sql.DB) error {
-	const maxAttempts = 5
-	const retryDelay = 5 * time.Second
-
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_, err := db.ExecContext(ctx, `SELECT fts_match_word('probe', content) FROM memories LIMIT 0`)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		msg := err.Error()
-		isProvisioning := strings.Contains(strings.ToLower(msg), "columnar") ||
-			strings.Contains(strings.ToLower(msg), "tiflash")
-		if isProvisioning {
-			slog.Warn("FTS index provisioning in progress; will retry",
-				"attempt", attempt, "max", maxAttempts, "err", err)
-			if attempt < maxAttempts {
-				time.Sleep(retryDelay)
-				continue
-			}
-			return fmt.Errorf("FTS not available after %d retries: %w", maxAttempts, lastErr)
-		}
-		// Not a provisioning issue — fail immediately.
-		return fmt.Errorf("FTS probe failed: %w", err)
-	}
-	return fmt.Errorf("FTS probe exhausted retries: %w", lastErr)
 }
 
 func (r *MemoryRepo) FTSAvailable() bool { return r.ftsAvailable.Load() }

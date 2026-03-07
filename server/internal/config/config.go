@@ -38,6 +38,12 @@ type Config struct {
 	TenantPoolIdleTimeout time.Duration
 	TenantPoolTotalLimit  int
 
+	// FTSEnabled controls whether full-text search is attempted.
+	// Set MNEMO_FTS_ENABLED=true only when the TiDB cluster supports
+	// FULLTEXT INDEX and FTS_MATCH_WORD with constant strings.
+	// Defaults to false (safe for all TiDB Serverless / TiDB Zero tiers).
+	FTSEnabled bool
+
 	// Upload directory for file storage.
 	// Files are stored at {UploadDir}/{tenantID}/{agentID}/{filename}.
 	UploadDir string
@@ -72,6 +78,7 @@ func Load() (*Config, error) {
 		TenantPoolIdleTimeout: envDuration("MNEMO_TENANT_POOL_IDLE_TIMEOUT", 10*time.Minute),
 		TenantPoolTotalLimit:  envInt("MNEMO_TENANT_POOL_TOTAL_LIMIT", 200),
 		UploadDir:             envOr("MNEMO_UPLOAD_DIR", "./uploads"),
+		FTSEnabled:            envBool("MNEMO_FTS_ENABLED", false),
 	}
 	// Validate ingest mode.
 	switch cfg.IngestMode {
