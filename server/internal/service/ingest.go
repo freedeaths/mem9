@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -23,9 +22,8 @@ import (
 type IngestMode string
 
 const (
-	ModeSmart   IngestMode = "smart"   // Extract + Digest + Reconcile
-	ModeExtract IngestMode = "extract" // Extract + Reconcile (no digest)
-	ModeDigest  IngestMode = "digest"  // Digest only (no extract/reconcile)
+	ModeSmart   IngestMode = "smart"   // Extract + Reconcile
+	ModeExtract IngestMode = "extract" // Extract + Reconcile (alias for smart)
 	ModeRaw     IngestMode = "raw"     // Store as-is (no LLM)
 )
 
@@ -46,8 +44,6 @@ type IngestMessage struct {
 // IngestResult is the output of the ingest pipeline.
 type IngestResult struct {
 	Status        string   `json:"status"` // complete | partial | failed
-	DigestStored  bool     `json:"digest_stored"`
-	DigestID      string   `json:"digest_id,omitempty"`
 	InsightsAdded int      `json:"insights_added"`
 	InsightIDs    []string `json:"insight_ids,omitempty"`
 	Warnings      int      `json:"warnings,omitempty"`
@@ -83,7 +79,7 @@ func NewIngestService(
 	}
 }
 
-// Ingest runs the pipeline: extract insights, generate digest, reconcile with existing memories.
+// Ingest runs the pipeline: extract facts from conversation, reconcile with existing memories.
 func (s *IngestService) Ingest(ctx context.Context, agentName string, req IngestRequest) (*IngestResult, error) {
 	if len(req.Messages) == 0 {
 		return nil, &domain.ValidationError{Field: "messages", Message: "required"}
@@ -112,72 +108,18 @@ func (s *IngestService) Ingest(ctx context.Context, agentName string, req Ingest
 	const maxConversationRunes = 32000
 	formatted = truncateRunes(formatted, maxConversationRunes)
 
-	result := &IngestResult{Status: "complete"}
-
-	wantDigest := mode == ModeSmart || mode == ModeDigest
-	wantExtract := mode == ModeSmart || mode == ModeExtract
-
-	// When both digest and extract are needed, run them concurrently.
-	// They are independent: digest summarizes the conversation, extract
-	// pulls atomic facts — neither needs the other's output.
-	var (
-		digestID   string
-		digestErr  error
-		insightIDs []string
-		warnings   int
-		extractErr error
-	)
-
-	if wantDigest && wantExtract {
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			digestID, digestErr = s.generateDigest(ctx, agentName, req.AgentID, req.SessionID, formatted)
-		}()
-		go func() {
-			defer wg.Done()
-			insightIDs, warnings, extractErr = s.extractAndReconcile(ctx, agentName, req.AgentID, req.SessionID, formatted)
-		}()
-		wg.Wait()
-	} else if wantDigest {
-		digestID, digestErr = s.generateDigest(ctx, agentName, req.AgentID, req.SessionID, formatted)
-	} else if wantExtract {
-		insightIDs, warnings, extractErr = s.extractAndReconcile(ctx, agentName, req.AgentID, req.SessionID, formatted)
+	insightIDs, warnings, err := s.extractAndReconcile(ctx, agentName, req.AgentID, req.SessionID, formatted)
+	if err != nil {
+		slog.Error("insight extraction failed", "err", err)
+		return &IngestResult{Status: "failed", Warnings: warnings}, nil
 	}
 
-	// Collect digest results.
-	if wantDigest {
-		if digestErr != nil {
-			slog.Error("digest generation failed", "err", digestErr)
-			if mode == ModeDigest {
-				result.Status = "failed"
-			} else {
-				result.Status = "partial"
-			}
-		} else if digestID != "" {
-			result.DigestStored = true
-			result.DigestID = digestID
-		}
-	}
-
-	// Collect extract+reconcile results.
-	if wantExtract {
-		if extractErr != nil {
-			slog.Error("insight extraction failed", "err", extractErr)
-			if result.DigestStored {
-				result.Status = "partial"
-			} else {
-				result.Status = "failed"
-			}
-		} else {
-			result.InsightsAdded = len(insightIDs)
-			result.InsightIDs = insightIDs
-		}
-		result.Warnings = warnings
-	}
-
-	return result, nil
+	return &IngestResult{
+		Status:        "complete",
+		InsightsAdded: len(insightIDs),
+		InsightIDs:    insightIDs,
+		Warnings:      warnings,
+	}, nil
 }
 
 // ingestRaw stores messages as a single raw memory (legacy behavior).
@@ -200,7 +142,7 @@ func (s *IngestService) ingestRaw(ctx context.Context, agentName string, req Ing
 	m := &domain.Memory{
 		ID:         uuid.New().String(),
 		Content:    content,
-		MemoryType: domain.TypeDigest,
+		MemoryType: domain.TypeInsight,
 		Source:     agentName,
 		AgentID:    req.AgentID,
 		SessionID:  req.SessionID,
@@ -216,91 +158,10 @@ func (s *IngestService) ingestRaw(ctx context.Context, agentName string, req Ing
 		return nil, fmt.Errorf("create raw memory: %w", err)
 	}
 	return &IngestResult{
-		Status:       "complete",
-		DigestStored: true,
-		DigestID:     m.ID,
+		Status:        "complete",
+		InsightsAdded: 1,
+		InsightIDs:    []string{m.ID},
 	}, nil
-}
-
-// generateDigest calls the LLM to generate a session summary and stores it.
-func (s *IngestService) generateDigest(ctx context.Context, agentName, agentID, sessionID, conversation string) (string, error) {
-	currentDate := time.Now().Format("2006-01-02")
-
-	systemPrompt := `You are a technical session summarizer. Your task is to condense a conversation 
-into a single concise paragraph capturing the key activities, decisions, and outcomes.
-
-## Rules
-
-1. Focus on WHAT was done, WHY, and the OUTCOME.
-2. Include specific technical details (file names, error messages, config values) when they have future value.
-3. Keep the summary between 1-3 sentences. Be dense, not verbose.
-4. Preserve the user's language. If the conversation is in Chinese, write the summary in Chinese.
-5. If the conversation is trivial (greeting, small talk), return an empty string.
-
-## Output Format
-
-Return ONLY valid JSON. No markdown fences.
-
-{"summary": "..."}`
-
-	userPrompt := fmt.Sprintf("Summarize this conversation. Today's date is %s.\n\n%s", currentDate, conversation)
-
-	raw, err := s.llm.CompleteJSON(ctx, systemPrompt, userPrompt)
-	if err != nil {
-		return "", fmt.Errorf("digest LLM call: %w", err)
-	}
-
-	type digestResponse struct {
-		Summary string `json:"summary"`
-	}
-	parsed, err := llm.ParseJSON[digestResponse](raw)
-	if err != nil {
-		// Retry once with stricter prompt.
-		raw2, retryErr := s.llm.CompleteJSON(ctx, systemPrompt,
-			"Your previous response was not valid JSON. Return ONLY the JSON object.\n\n"+userPrompt)
-		if retryErr != nil {
-			return "", fmt.Errorf("digest retry: %w", retryErr)
-		}
-		parsed, err = llm.ParseJSON[digestResponse](raw2)
-		if err != nil {
-			return "", fmt.Errorf("digest JSON parse after retry: %w", err)
-		}
-	}
-
-	if parsed.Summary == "" {
-		return "", nil // Trivial conversation, no digest needed.
-	}
-
-	var embedding []float32
-	if s.autoModel == "" && s.embedder != nil {
-		var embedErr error
-		embedding, embedErr = s.embedder.Embed(ctx, parsed.Summary)
-		if embedErr != nil {
-			slog.Warn("embedding failed for digest", "err", embedErr)
-		}
-	}
-
-	now := time.Now()
-	m := &domain.Memory{
-		ID:         uuid.New().String(),
-		Content:    parsed.Summary,
-		MemoryType: domain.TypeDigest,
-		Source:     agentName,
-		AgentID:    agentID,
-		SessionID:  sessionID,
-		Embedding:  embedding,
-		State:      domain.StateActive,
-		Version:    1,
-		UpdatedBy:  agentName,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-	}
-
-	if err := s.memories.Create(ctx, m); err != nil {
-		return "", fmt.Errorf("store digest: %w", err)
-	}
-
-	return m.ID, nil
 }
 
 // extractAndReconcile runs Phase 1a (extraction) + Phase 2 (reconciliation).
@@ -557,8 +418,8 @@ Analyze the new facts and determine whether each should be added, updated, or de
 }
 
 // gatherExistingMemories searches relevant memories for each fact, deduplicates
-// by ID, and returns a single flat list. Insights are scoped to the requesting
-// agent; pinned memories are space-level.
+// by ID, and returns a single flat list. All memories (pinned + insight) belong
+// to the same agent, so a single query with agent_id scoping is sufficient.
 //
 // Graceful degradation contract: on any search/list failure, the error is logged
 // and that source is skipped. A nil return means all sources failed or the store
@@ -569,77 +430,59 @@ func (s *IngestService) gatherExistingMemories(ctx context.Context, agentID stri
 	const contentMaxLen = 150
 	const maxExistingMemories = 60 // Cap total results to prevent LLM token overflow
 
-	if s.embedder == nil && s.autoModel == "" {
-		// No vector search — fall back to listing recent memories.
-		var result []domain.Memory
-		seen := make(map[string]struct{})
-		for _, filter := range []domain.MemoryFilter{
-			{State: "active", MemoryType: "insight", AgentID: agentID, Limit: perFactLimit * len(facts)},
-			{State: "active", MemoryType: "pinned", Limit: perFactLimit},
-		} {
-			mems, _, err := s.memories.List(ctx, filter)
-			if err != nil {
-				slog.Warn("list memories for reconcile failed", "err", err, "type", filter.MemoryType)
-				continue
-			}
-			for _, m := range mems {
-				if _, ok := seen[m.ID]; ok {
-					continue
-				}
-				seen[m.ID] = struct{}{}
-				m.Content = truncateRunes(m.Content, contentMaxLen)
-				result = append(result, m)
-			}
-		}
-		if len(result) > maxExistingMemories {
-			slog.Warn("gatherExistingMemories: truncating no-vector results", "count", len(result), "max", maxExistingMemories)
-			result = result[:maxExistingMemories]
-		}
-		return result
+	filter := domain.MemoryFilter{
+		State:      "active",
+		MemoryType: "insight,pinned",
+		AgentID:    agentID,
 	}
 
-	// Vector search: for each fact, search insights (agent-scoped) and pinned
-	// (space-level), then deduplicate across all results.
+	if s.embedder == nil && s.autoModel == "" {
+		// No vector search — fall back to listing recent memories.
+		filter.Limit = perFactLimit * len(facts)
+		if filter.Limit > maxExistingMemories {
+			filter.Limit = maxExistingMemories
+		}
+		mems, _, err := s.memories.List(ctx, filter)
+		if err != nil {
+			slog.Warn("list memories for reconcile failed", "err", err)
+			return nil
+		}
+		for i := range mems {
+			mems[i].Content = truncateRunes(mems[i].Content, contentMaxLen)
+		}
+		return mems
+	}
+
+	// Vector search: for each fact, search top-K and deduplicate across all results.
 	seen := make(map[string]struct{})
 	var result []domain.Memory
 
-	insightFilter := domain.MemoryFilter{State: "active", MemoryType: "insight", AgentID: agentID}
-	pinnedFilter := domain.MemoryFilter{State: "active", MemoryType: "pinned"}
-
 	for _, fact := range facts {
-		// Pre-compute embedding once per fact.
-		var vec []float32
-		if s.autoModel == "" {
-			var err error
-			vec, err = s.embedder.Embed(ctx, fact)
-			if err != nil {
-				slog.Warn("embedding failed for fact during reconcile", "err", err)
+		var matches []domain.Memory
+		var err error
+
+		if s.autoModel != "" {
+			matches, err = s.memories.AutoVectorSearch(ctx, fact, filter, perFactLimit)
+		} else {
+			vec, embedErr := s.embedder.Embed(ctx, fact)
+			if embedErr != nil {
+				slog.Warn("embedding failed for fact during reconcile", "err", embedErr)
 				continue
 			}
+			matches, err = s.memories.VectorSearch(ctx, vec, filter, perFactLimit)
+		}
+		if err != nil {
+			slog.Warn("vector search failed during reconcile", "err", err)
+			continue
 		}
 
-		for _, filter := range []domain.MemoryFilter{insightFilter, pinnedFilter} {
-			var matches []domain.Memory
-			var err error
-
-			if s.autoModel != "" {
-				matches, err = s.memories.AutoVectorSearch(ctx, fact, filter, perFactLimit)
-			} else {
-				matches, err = s.memories.VectorSearch(ctx, vec, filter, perFactLimit)
-			}
-			if err != nil {
-				slog.Warn("vector search failed during reconcile", "err", err, "type", filter.MemoryType)
+		for _, m := range matches {
+			if _, ok := seen[m.ID]; ok {
 				continue
 			}
-
-			for _, m := range matches {
-				if _, ok := seen[m.ID]; ok {
-					continue
-				}
-				seen[m.ID] = struct{}{}
-				m.Content = truncateRunes(m.Content, contentMaxLen)
-				result = append(result, m)
-			}
+			seen[m.ID] = struct{}{}
+			m.Content = truncateRunes(m.Content, contentMaxLen)
+			result = append(result, m)
 		}
 	}
 

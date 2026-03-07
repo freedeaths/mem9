@@ -25,17 +25,14 @@ func TestApplyTypeWeights(t *testing.T) {
 			mems: map[string]domain.Memory{
 				"pinned":  {ID: "pinned", MemoryType: domain.TypePinned},
 				"insight": {ID: "insight", MemoryType: domain.TypeInsight},
-				"digest":  {ID: "digest", MemoryType: domain.TypeDigest},
 			},
 			scores: map[string]float64{
 				"pinned":  1.0,
 				"insight": 2.0,
-				"digest":  3.0,
 			},
 			want: map[string]float64{
 				"pinned":  1.2,
 				"insight": 2.0,
-				"digest":  2.4,
 			},
 		},
 		{

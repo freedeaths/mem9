@@ -13,7 +13,6 @@ type MemoryType string
 const (
 	TypePinned  MemoryType = "pinned"
 	TypeInsight MemoryType = "insight"
-	TypeDigest  MemoryType = "digest"
 )
 
 // MemoryState represents the lifecycle state of a memory.

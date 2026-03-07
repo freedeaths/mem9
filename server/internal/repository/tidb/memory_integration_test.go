@@ -270,7 +270,7 @@ func TestList(t *testing.T) {
 			m.Tags = []string{"go"}
 		}),
 		newTestMemory(func(m *domain.Memory) {
-			m.MemoryType = domain.TypeDigest
+			m.MemoryType = domain.TypeInsight
 			m.AgentID = "agent-b"
 			m.SessionID = "sess-2"
 			m.Source = "src-b"
@@ -534,13 +534,13 @@ func TestKeywordSearch(t *testing.T) {
 		t.Fatalf("expected 1 result with limit=1, got %d", len(results))
 	}
 
-	// Search with memory_type filter.
-	results, err = repo.KeywordSearch(ctx, "Go", domain.MemoryFilter{MemoryType: "digest"}, 50)
+	// Search with memory_type filter that doesn't match any test data.
+	results, err = repo.KeywordSearch(ctx, "Go", domain.MemoryFilter{MemoryType: "pinned"}, 50)
 	if err != nil {
 		t.Fatalf("KeywordSearch with filter: %v", err)
 	}
 	if len(results) != 0 {
-		t.Fatalf("expected 0 results for type=digest, got %d", len(results))
+		t.Fatalf("expected 0 results for type=pinned, got %d", len(results))
 	}
 }
 

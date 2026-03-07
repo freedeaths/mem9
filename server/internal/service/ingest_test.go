@@ -286,7 +286,7 @@ func TestIngestEmptyMessages(t *testing.T) {
 	}
 }
 
-func TestIngestModeRawStoresDigest(t *testing.T) {
+func TestIngestModeRawStoresInsight(t *testing.T) {
 	t.Parallel()
 
 	memRepo := &memoryRepoMock{}
@@ -309,8 +309,8 @@ func TestIngestModeRawStoresDigest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Ingest() error = %v", err)
 	}
-	if res == nil || !res.DigestStored {
-		t.Fatalf("expected digest stored, got %#v", res)
+	if res == nil || res.InsightsAdded != 1 {
+		t.Fatalf("expected 1 insight added, got %#v", res)
 	}
 	if len(memRepo.createCalls) != 1 {
 		t.Fatalf("expected 1 Create call, got %d", len(memRepo.createCalls))
@@ -321,8 +321,8 @@ func TestIngestModeRawStoresDigest(t *testing.T) {
 	if created.Content != expectedContent {
 		t.Fatalf("unexpected content: %q", created.Content)
 	}
-	if created.MemoryType != domain.TypeDigest {
-		t.Fatalf("expected memory type digest, got %q", created.MemoryType)
+	if created.MemoryType != domain.TypeInsight {
+		t.Fatalf("expected memory type insight, got %q", created.MemoryType)
 	}
 }
 
@@ -346,8 +346,8 @@ func TestIngestNilLLMFallsBackToRaw(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Ingest() error = %v", err)
 	}
-	if res == nil || !res.DigestStored {
-		t.Fatalf("expected digest stored, got %#v", res)
+	if res == nil || res.InsightsAdded != 1 {
+		t.Fatalf("expected 1 insight added, got %#v", res)
 	}
 	if len(memRepo.createCalls) != 1 {
 		t.Fatalf("expected 1 Create call, got %d", len(memRepo.createCalls))
