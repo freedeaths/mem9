@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -51,30 +53,24 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		messages := append([]service.IngestMessage(nil), req.Messages...)
 		ingestReq := service.IngestRequest{
-			Messages:  req.Messages,
+			Messages:  messages,
 			SessionID: req.SessionID,
 			AgentID:   agentID,
 			Mode:      req.Mode,
 		}
 
-		result, err := svc.ingest.Ingest(r.Context(), auth.AgentName, ingestReq)
-		if err != nil {
-			s.handleError(w, err)
-			return
-		}
+		go func(agentName string, req service.IngestRequest) {
+			result, err := svc.ingest.Ingest(context.Background(), agentName, req)
+			if err != nil {
+				slog.Error("async memories ingest failed", "agent", req.AgentID, "session", req.SessionID, "err", err)
+				return
+			}
+			slog.Info("async memories ingest complete", "agent", req.AgentID, "session", req.SessionID, "status", result.Status, "memories_changed", result.MemoriesChanged)
+		}(auth.AgentName, ingestReq)
 
-		status := http.StatusOK
-		switch result.Status {
-		case "complete":
-			status = http.StatusOK
-		case "partial":
-			status = 207 // Multi-Status
-		case "failed":
-			status = http.StatusBadGateway
-		}
-
-		respond(w, status, result)
+		respond(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 		return
 	}
 
@@ -86,24 +82,23 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 		s.handleError(w, &domain.ValidationError{Field: "body", Message: "content mode does not accept tags/metadata/mode"})
 		return
 	}
-
-	result, err := svc.ingest.ReconcileContent(r.Context(), auth.AgentName, agentID, req.SessionID, []string{req.Content})
-	if err != nil {
-		s.handleError(w, err)
+	if !svc.ingest.HasLLM() {
+		s.handleError(w, &domain.ValidationError{Field: "llm", Message: "LLM is required for reconciliation"})
 		return
 	}
 
-	status := http.StatusCreated
-	switch result.Status {
-	case "complete":
-		status = http.StatusCreated
-	case "partial":
-		status = 207 // Multi-Status
-	case "failed":
-		status = http.StatusBadGateway
-	}
+	content := req.Content
+	sessionID := req.SessionID
+	go func(agentName, agentID, sessionID, content string) {
+		result, err := svc.ingest.ReconcileContent(context.Background(), agentName, agentID, sessionID, []string{content})
+		if err != nil {
+			slog.Error("async memories reconcile failed", "agent", agentID, "session", sessionID, "err", err)
+			return
+		}
+		slog.Info("async memories reconcile complete", "agent", agentID, "session", sessionID, "status", result.Status, "memories_changed", result.MemoriesChanged)
+	}(auth.AgentName, agentID, sessionID, content)
 
-	respond(w, status, result)
+	respond(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 }
 
 type listResponse struct {
