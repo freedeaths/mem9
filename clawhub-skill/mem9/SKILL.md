@@ -143,6 +143,7 @@ Or if no `openclaw.json` exists, create:
     "allow": ["mem9"]
   }
 }
+```
 
 #### OpenClaw <2.2.0
 
