@@ -1,7 +1,6 @@
 import type { MemoryBackend } from "./backend.js";
 import { ServerBackend } from "./server-backend.js";
 import { registerHooks } from "./hooks.js";
-import { runBootstrapImport } from "./init.js";
 import type {
   PluginConfig,
   CreateMemoryInput,
@@ -224,7 +223,7 @@ function buildTools(backend: MemoryBackend): AnyAgentTool[] {
 }
 
 const mnemoPlugin = {
-  id: "openclaw",
+  id: "mem9",
   name: "Mnemo Memory",
   description:
     "AI agent memory — server mode (mnemo-server) with hybrid vector + keyword search.",
@@ -236,13 +235,6 @@ const mnemoPlugin = {
       api.logger.info(`[mnemo] apiUrl not configured, using default ${DEFAULT_API_URL}`);
     }
 
-    try {
-      await runBootstrapImport(api.logger);
-    } catch (err) {
-      api.logger.error(
-        `[mnemo] init: bootstrap import failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
 
     const configuredTenantID = cfg.tenantID;
     const registerTenant = async (agentName: string): Promise<string> => {
