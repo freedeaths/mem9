@@ -15,6 +15,8 @@ import (
 
 type memoryRepoMock struct {
 	createCalls          []*domain.Memory
+	getByID              map[string]*domain.Memory
+	getByIDErr           error
 	setStateCalls        []setStateCall  // track SetState invocations
 	setStateErr          error           // configurable return value for SetState
 	vectorResults        []domain.Memory // configurable results for AutoVectorSearch
@@ -41,6 +43,19 @@ func (m *memoryRepoMock) Create(ctx context.Context, mem *domain.Memory) error {
 }
 
 func (m *memoryRepoMock) GetByID(ctx context.Context, id string) (*domain.Memory, error) {
+	if m.getByIDErr != nil {
+		return nil, m.getByIDErr
+	}
+	if mem, ok := m.getByID[id]; ok {
+		cp := *mem
+		return &cp, nil
+	}
+	for _, mem := range m.createCalls {
+		if mem.ID == id {
+			cp := *mem
+			return &cp, nil
+		}
+	}
 	return nil, domain.ErrNotFound
 }
 
