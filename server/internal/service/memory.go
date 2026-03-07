@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/qiffang/mnemos/server/internal/domain"
 	"github.com/qiffang/mnemos/server/internal/embed"
+	"github.com/qiffang/mnemos/server/internal/llm"
 	"github.com/qiffang/mnemos/server/internal/repository"
 )
 
@@ -27,46 +28,49 @@ type MemoryService struct {
 	memories  repository.MemoryRepo
 	embedder  *embed.Embedder
 	autoModel string
+	ingest    *IngestService
 }
 
-func NewMemoryService(memories repository.MemoryRepo, embedder *embed.Embedder, autoModel string) *MemoryService {
-	return &MemoryService{memories: memories, embedder: embedder, autoModel: autoModel}
+func NewMemoryService(memories repository.MemoryRepo, llmClient *llm.Client, embedder *embed.Embedder, autoModel string, ingestMode IngestMode) *MemoryService {
+	return &MemoryService{
+		memories:  memories,
+		embedder:  embedder,
+		autoModel: autoModel,
+		ingest:    NewIngestService(memories, llmClient, embedder, autoModel, ingestMode),
+	}
 }
 
-func (s *MemoryService) Create(ctx context.Context, agentName, content string, tags []string, metadata json.RawMessage) (*domain.Memory, error) {
+func (s *MemoryService) Create(ctx context.Context, agentID, content string, tags []string, metadata json.RawMessage) (*domain.Memory, error) {
 	if err := validateMemoryInput(content, tags); err != nil {
 		return nil, err
 	}
-
-	var embedding []float32
-	if s.autoModel == "" && s.embedder != nil {
-		var err error
-		embedding, err = s.embedder.Embed(ctx, content)
-		if err != nil {
-			return nil, err
-		}
+	if len(tags) > 0 || len(metadata) > 0 {
+		return nil, &domain.ValidationError{Field: "body", Message: "tags/metadata are not supported with content reconciliation"}
 	}
 
-	now := time.Now()
-	m := &domain.Memory{
-		ID:         uuid.New().String(),
-		Content:    content,
-		Source:     agentName,
-		Tags:       tags,
-		Metadata:   metadata,
-		Embedding:  embedding,
-		MemoryType: domain.TypePinned,
-		State:      domain.StateActive,
-		Version:    1,
-		UpdatedBy:  agentName,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+	if s.ingest == nil || !s.ingest.HasLLM() {
+		return nil, &domain.ValidationError{Field: "llm", Message: "LLM is required for content reconciliation"}
 	}
 
-	if err := s.memories.Create(ctx, m); err != nil {
+	result, err := s.ingest.ReconcileContent(ctx, agentID, agentID, "", []string{content})
+	if err != nil {
 		return nil, err
 	}
-	return m, nil
+
+	if result.Status == "failed" {
+		return nil, fmt.Errorf("content reconciliation failed")
+	}
+	if len(result.InsightIDs) == 0 {
+		return nil, nil
+	}
+
+	latestID := result.InsightIDs[len(result.InsightIDs)-1]
+	mem, getErr := s.memories.GetByID(ctx, latestID)
+	if getErr != nil {
+		return nil, fmt.Errorf("fetch reconciled memory %s: %w", latestID, getErr)
+	}
+	return mem, nil
+
 }
 
 // Get returns a single memory by ID.

@@ -83,13 +83,24 @@ func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mem, err := svc.memory.Create(r.Context(), agentID, req.Content, req.Tags, req.Metadata)
-	if err != nil {
-		s.handleError(w, err)
-		return
-	}
+	tags := append([]string(nil), req.Tags...)
+	metadata := append(json.RawMessage(nil), req.Metadata...)
+	content := req.Content
 
-	respond(w, http.StatusCreated, mem)
+	go func(agentName, actorAgentID, content string, tags []string, metadata json.RawMessage) {
+		mem, err := svc.memory.Create(context.Background(), actorAgentID, content, tags, metadata)
+		if err != nil {
+			slog.Error("async memory create failed", "agent", actorAgentID, "actor", agentName, "err", err)
+			return
+		}
+		if mem != nil {
+			slog.Info("async memory create complete", "agent", actorAgentID, "actor", agentName, "memory_id", mem.ID)
+			return
+		}
+		slog.Info("async memory create complete", "agent", actorAgentID, "actor", agentName, "memory_id", "")
+	}(auth.AgentName, agentID, content, tags, metadata)
+
+	respond(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 }
 
 type listResponse struct {
