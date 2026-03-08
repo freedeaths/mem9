@@ -1,34 +1,35 @@
 ---
-const agents = [
-  {
-    name: 'OpenClaw',
-    desc: 'Unlimited memory',
-    detail: "Give your OpenClaw agents memory that never expires. Recall past conversations, reuse learned knowledge, and stay consistent - session after session.",
-  },
-];
+import type { SitePlatformsCopy } from '../content/site';
+
+interface Props {
+  platforms: SitePlatformsCopy;
+}
+
+const { platforms } = Astro.props;
 ---
 
 <section id="platforms" class="agents">
   <div class="container">
     <div class="section-head">
-      <p class="section-kicker">Platforms</p>
-      <h2 class="section-title">One memory layer. Every agent.</h2>
-      <p class="section-desc">
-        Agents shouldn't lose context when they switch tools. mem9 gives every agent in your
-        stack a shared, persistent memory - durable, searchable, and always in sync.
+      <p class="section-kicker" data-i18n="platforms.kicker">{platforms.kicker}</p>
+      <h2 class="section-title" data-i18n="platforms.title">{platforms.title}</h2>
+      <p class="section-desc" data-i18n="platforms.description">
+        {platforms.description}
       </p>
     </div>
     <div class="agent-grid">
-      {agents.map((agent) => (
+      {platforms.items.map((agent, index) => (
         <div class="agent-card">
-          <div class="agent-name">{agent.name}</div>
-          <div class="agent-desc">{agent.desc}</div>
-          <div class="agent-detail">{agent.detail}</div>
+          <div class="agent-name" data-i18n={`platforms.items.${index}.name`}>{agent.name}</div>
+          <div class="agent-desc" data-i18n={`platforms.items.${index}.desc`}>{agent.desc}</div>
+          <div class="agent-detail" data-i18n={`platforms.items.${index}.detail`}>
+            {agent.detail}
+          </div>
         </div>
       ))}
     </div>
-    <p class="agent-note">
-      Also works with any client that can read or write through the mem9 API layer.
+    <p class="agent-note" data-i18n="platforms.note">
+      {platforms.note}
     </p>
   </div>
 </section>
@@ -60,10 +61,11 @@ const agents = [
   }
 
   .agent-card {
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.02));
+    background: linear-gradient(180deg, var(--surface-gradient-start), var(--surface-gradient-end));
     border: 1px solid var(--border);
     border-radius: 1rem;
     padding: 1.5rem;
+    box-shadow: var(--surface-inset), var(--surface-shadow);
     transition: border-color 0.2s ease, transform 0.2s ease;
   }
 

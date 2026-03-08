@@ -1,19 +1,41 @@
 ---
-const base = import.meta.env.BASE_URL;
+import type { SiteFooterCopy } from '../content/site';
+
+interface Props {
+  footer: SiteFooterCopy;
+}
+
+const { footer } = Astro.props;
 ---
 
 <footer class="footer">
   <div class="container footer-inner">
     <p class="brand"><span>MEM</span><span class="brand-accent">9</span></p>
     <div class="footer-links">
-      <a href="https://github.com/mem9-ai/mem9" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/mem9-ai/mem9" target="_blank" rel="noopener" data-i18n="footer.github">
+        {footer.github}
+      </a>
       <span class="sep">/</span>
-      <a href="https://github.com/mem9-ai/mem9/blob/main/LICENSE" target="_blank" rel="noopener">Apache-2.0</a>
+      <a
+        href="https://github.com/mem9-ai/mem9/blob/main/LICENSE"
+        target="_blank"
+        rel="noopener"
+        data-i18n="footer.license"
+      >
+        {footer.license}
+      </a>
       <span class="sep">/</span>
-      <a href="https://github.com/mem9-ai/mem9/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+      <a
+        href="https://github.com/mem9-ai/mem9/blob/main/CONTRIBUTING.md"
+        target="_blank"
+        rel="noopener"
+        data-i18n="footer.contributing"
+      >
+        {footer.contributing}
+      </a>
     </div>
-    <p class="copyright">
-      mem9.ai. Unlimited memory infrastructure for AI agents.
+    <p class="copyright" data-i18n="footer.copyright">
+      {footer.copyright}
     </p>
   </div>
 </footer>
@@ -54,8 +76,10 @@ const base = import.meta.env.BASE_URL;
   .sep {
     color: var(--text-dim);
   }
+
   .copyright {
     font-size: 0.85rem;
     color: var(--text-dim);
+    text-align: center;
   }
 </style>

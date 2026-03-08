@@ -1,49 +1,47 @@
 ---
-const onboardingCommand =
-  'Read https://mem9.ai/SKILL.md and follow the instructions to install and configure mem9 for OpenClaw';
-const highlights = [
-  {
-    title: 'Never forget again',
-    description: 'Cloud-persistent memory that survives resets, restarts, and machine switches.',
-  },
-  {
-    title: 'Securely backed up',
-    description: 'Your agent memory lives in durable cloud storage, not fragile local files.',
-  },
-  {
-    title: 'Seamless onboarding',
-    description:
-      'Start with one instruction, then bring over existing memory without breaking your flow.',
-  },
-];
+import type { SiteAriaCopy, SiteHeroCopy } from '../content/site';
+
+interface Props {
+  hero: SiteHeroCopy;
+  aria: SiteAriaCopy;
+}
+
+const { hero, aria } = Astro.props;
 ---
 
 <section class="hero">
   <div class="container hero-shell">
     <div class="hero-copy">
-      <p class="eyebrow">MEM9.AI</p>
+      <p class="eyebrow" data-i18n="hero.eyebrow">{hero.eyebrow}</p>
 
       <h1 class="title">
-        <span class="title-line">Unlimited memory</span>
-        <span class="title-muted"><span class="title-inline">for OpenClaw<span class="cursor"></span></span></span>
+        <span class="title-line" data-i18n="hero.titleLead">{hero.titleLead}</span>
+        <span class="title-muted">
+          <span class="title-inline">
+            <span data-i18n="hero.titleAccent">{hero.titleAccent}</span>
+            <span class="cursor"></span>
+          </span>
+        </span>
       </h1>
-      <p class="subtitle">
-        Your agents forget everything between sessions. mem9 fixes that. Persistent memory
-        infrastructure with hybrid search, shared spaces, and cross-agent recall - from first
-        write to forever.
+
+      <p class="subtitle" data-i18n="hero.subtitle">
+        {hero.subtitle}
       </p>
 
       <div class="cta-grid">
         <div class="cta-card surface-card">
-          <p class="cta-label">Agent Onboarding</p>
+          <p class="cta-label" data-i18n="hero.onboardingLabel">{hero.onboardingLabel}</p>
           <div class="cta-command">
-            <code>{onboardingCommand}</code>
+            <code data-i18n="hero.onboardingCommand">{hero.onboardingCommand}</code>
             <button
               type="button"
               class="copy-button"
-              data-copy-text={onboardingCommand}
-              aria-label="Copy onboarding instructions"
-              title="Copy onboarding instructions"
+              data-copy-button
+              data-copy-key="hero.onboardingCommand"
+              data-copy-text={hero.onboardingCommand}
+              aria-label={aria.copyOnboarding}
+              title={aria.copyOnboarding}
+              data-i18n-attr="aria-label:aria.copyOnboarding;title:aria.copyOnboarding"
             >
               <svg class="copy-icon copy-icon-default" viewBox="0 0 24 24" aria-hidden="true">
                 <path
@@ -75,14 +73,19 @@ const highlights = [
               </svg>
             </button>
           </div>
+          <p class="sr-only" data-copy-feedback aria-live="polite"></p>
         </div>
       </div>
 
       <div class="hero-highlights">
-        {highlights.map((highlight) => (
+        {hero.highlights.map((highlight, index) => (
           <article class="highlight-card surface-card">
-            <h2 class="highlight-title">{highlight.title}</h2>
-            <p class="highlight-description">{highlight.description}</p>
+            <h2 class="highlight-title" data-i18n={`hero.highlights.${index}.title`}>
+              {highlight.title}
+            </h2>
+            <p class="highlight-description" data-i18n={`hero.highlights.${index}.description`}>
+              {highlight.description}
+            </p>
           </article>
         ))}
       </div>
@@ -132,7 +135,7 @@ const highlights = [
 
   .title-muted {
     display: block;
-    color: rgba(255, 255, 255, 0.62);
+    color: var(--text-hero-muted);
     margin-top: 0.06em;
   }
 
@@ -159,7 +162,7 @@ const highlights = [
   .cta-card {
     padding: 1rem 1rem 1.05rem;
     min-height: 132px;
-    background: rgba(255, 255, 255, 0.02);
+    background: linear-gradient(180deg, var(--surface-elevated-start), var(--surface-elevated-end));
   }
 
   .cta-label {
@@ -196,7 +199,7 @@ const highlights = [
     padding: 0;
     border: 1px solid var(--border);
     border-radius: 0.7rem;
-    background: rgba(255, 255, 255, 0.04);
+    background: var(--button-bg);
     color: var(--white-soft);
     cursor: pointer;
     transition: background-color 0.2s, border-color 0.2s, color 0.2s;
@@ -212,13 +215,14 @@ const highlights = [
   }
 
   .copy-button:hover {
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--button-hover-bg);
     border-color: var(--border-strong);
   }
 
   .copy-button.is-copied {
     color: var(--accent);
-    border-color: rgba(255, 255, 255, 0.3);
+    background: var(--button-active-bg);
+    border-color: var(--button-active-border);
   }
 
   .copy-button.is-copied .copy-icon-default {
@@ -239,7 +243,7 @@ const highlights = [
   .highlight-card {
     min-height: 140px;
     padding: 1rem 1rem 1.05rem;
-    background: rgba(255, 255, 255, 0.02);
+    background: linear-gradient(180deg, var(--surface-elevated-start), var(--surface-elevated-end));
   }
 
   .highlight-title {
@@ -366,27 +370,3 @@ const highlights = [
     }
   }
 </style>
-
-<script>
-  const copyButton = document.querySelector('.copy-button');
-
-  copyButton?.addEventListener('click', async () => {
-    const text = copyButton.getAttribute('data-copy-text');
-    if (!text) return;
-
-    try {
-      await navigator.clipboard.writeText(text);
-      copyButton.classList.add('is-copied');
-
-      window.setTimeout(() => {
-        copyButton.classList.remove('is-copied');
-      }, 1600);
-    } catch {
-      copyButton.classList.add('is-copied');
-
-      window.setTimeout(() => {
-        copyButton.classList.remove('is-copied');
-      }, 1600);
-    }
-  });
-</script>
