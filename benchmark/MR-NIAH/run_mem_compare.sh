@@ -33,6 +33,11 @@ MRNIAH_OPENCLAW_TIMEOUT="${MRNIAH_OPENCLAW_TIMEOUT:-0}"
 MRNIAH_CLEAN_SESSIONS="${MRNIAH_CLEAN_SESSIONS:-1}"
 MRNIAH_WIPE_AGENT_SESSIONS="${MRNIAH_WIPE_AGENT_SESSIONS:-1}"
 
+# mem9 isolation strategy for the mem-enabled profile:
+# - "clear": reuse one tenant and clear memories pre/post each case
+# - "tenant": provision a fresh tenant per case (strong isolation; recommended)
+MRNIAH_MEM9_ISOLATION="${MRNIAH_MEM9_ISOLATION:-tenant}"
+
 # If set to 1, the mem profile will be regenerated from the base profile before running.
 MRNIAH_RESET_MEM_PROFILE="${MRNIAH_RESET_MEM_PROFILE:-0}"
 
@@ -65,6 +70,8 @@ Notes:
 - --profile runs only that OpenClaw profile (skips baseline-vs-mem comparison).
 - --compare skips runs and compares existing results-* directories for BASE_PROFILE/MEM_PROFILE.
 - Set MRNIAH_OPENCLAW_TIMEOUT=<seconds> to force an explicit openclaw agent timeout.
+- Set MRNIAH_MEM9_ISOLATION=tenant (default) to provision a fresh mem9 tenant per case.
+- Set MRNIAH_MEM9_ISOLATION=clear to reuse one tenant and clear memories per case.
 - By default, uses hosted mem9 at https://api.mem9.ai (override via MEM9_BASE_URL).
 - This script starts two OpenClaw gateways (baseline + mem) on separate ports.
 EOF
@@ -261,15 +268,21 @@ wait_gateway_healthy() {
   return 1
 }
 
+configure_gateway_settings() {
+  local profile="$1"
+  local port="$2"
+  log "Configuring gateway for profile=$profile port=$port"
+  openclaw --profile "$profile" config set gateway.mode local >/dev/null
+  openclaw --profile "$profile" config set gateway.port "$port" >/dev/null
+  openclaw --profile "$profile" config set gateway.auth.token "$MRNIAH_GATEWAY_TOKEN" >/dev/null
+}
+
 start_gateway() {
   local profile="$1"
   local port="$2"
   local log_path="$3"
 
-  log "Configuring gateway for profile=$profile port=$port"
-  openclaw --profile "$profile" config set gateway.mode local >/dev/null
-  openclaw --profile "$profile" config set gateway.port "$port" >/dev/null
-  openclaw --profile "$profile" config set gateway.auth.token "$MRNIAH_GATEWAY_TOKEN" >/dev/null
+  configure_gateway_settings "$profile" "$port"
 
   log "Starting OpenClaw gateway for profile=$profile (port=$port, logs=$log_path)"
   nohup openclaw --profile "$profile" gateway >"$log_path" 2>&1 &
@@ -387,8 +400,13 @@ configure_mem_profile() {
   local api_url
   api_url="$(normalize_url "$MEM9_BASE_URL")"
 
-  MEM9_SPACE_ID="$(provision_tenant)"
-  log "Provisioned fresh mem9 space ID: $MEM9_SPACE_ID"
+  if [[ "$MRNIAH_MEM9_ISOLATION" == "clear" ]]; then
+    MEM9_SPACE_ID="$(provision_tenant)"
+    log "Provisioned fresh mem9 space ID: $MEM9_SPACE_ID"
+  else
+    MEM9_SPACE_ID="__per_case__"
+    log "mem9 isolation=tenant: provisioning a fresh mem9 space per case (tenantID will be set by run_batch.py)"
+  fi
 
   log "Configuring mem profile: $MEM_PROFILE"
   openclaw --profile "$MEM_PROFILE" config set gateway.mode local >/dev/null
@@ -413,7 +431,15 @@ run_batch_for_profile() {
   # Use -u to avoid Python stdout buffering when output is piped through tee.
   local cmd=(python3 -u run_batch.py --profile "$profile" --agent "$AGENT_NAME" --limit "$SAMPLE_LIMIT")
   if [[ "$profile" == "$MEM_PROFILE" ]]; then
-    cmd+=(--import-sessions --mem9-clear-memories --mem9-api-url "$MEM9_BASE_URL" --mem9-tenant-id "$MEM9_SPACE_ID")
+    cmd+=(--import-sessions --mem9-api-url "$MEM9_BASE_URL")
+    if [[ "$MRNIAH_MEM9_ISOLATION" == "clear" ]]; then
+      cmd+=(--mem9-clear-memories --mem9-tenant-id "$MEM9_SPACE_ID")
+    elif [[ "$MRNIAH_MEM9_ISOLATION" == "tenant" ]]; then
+      cmd+=(--mem9-provision-per-case --gateway-port "$MEM_GATEWAY_PORT" --gateway-log "$MEM_GATEWAY_LOG")
+    else
+      echo "ERROR: Invalid MRNIAH_MEM9_ISOLATION=$MRNIAH_MEM9_ISOLATION (expected: tenant|clear)" >&2
+      exit 2
+    fi
   fi
   if [[ "${MRNIAH_OPENCLAW_TIMEOUT}" != "0" ]]; then
     cmd+=(--openclaw-timeout "$MRNIAH_OPENCLAW_TIMEOUT")
@@ -653,13 +679,21 @@ EOF
     local prof="$RUN_ONLY_PROFILE"
     local gw_log="${LOG_DIR}/gateway_${prof}_${BASE_GATEWAY_PORT}.log"
     BASE_GATEWAY_LOG="$gw_log"
-    BASE_GATEWAY_PID="$(start_gateway "$prof" "$BASE_GATEWAY_PORT" "$gw_log")"
-    if ! wait_gateway_healthy "$BASE_GATEWAY_PORT" "$BASE_GATEWAY_PID" "$gw_log"; then
-      echo "ERROR: Gateway failed to become healthy. Logs:" >&2
-      tail -80 "$gw_log" >&2 || true
-      exit 2
+    if [[ "$prof" == "$MEM_PROFILE" && "$MRNIAH_MEM9_ISOLATION" == "tenant" ]]; then
+      # run_batch.py will restart the gateway per case to pick up the tenantID override.
+      configure_gateway_settings "$prof" "$BASE_GATEWAY_PORT"
+      MEM_GATEWAY_PORT="$BASE_GATEWAY_PORT"
+      MEM_GATEWAY_LOG="$gw_log"
+      log "Gateway will be managed per-case by run_batch.py (port=${MEM_GATEWAY_PORT}, log=${MEM_GATEWAY_LOG})"
+    else
+      BASE_GATEWAY_PID="$(start_gateway "$prof" "$BASE_GATEWAY_PORT" "$gw_log")"
+      if ! wait_gateway_healthy "$BASE_GATEWAY_PORT" "$BASE_GATEWAY_PID" "$gw_log"; then
+        echo "ERROR: Gateway failed to become healthy. Logs:" >&2
+        tail -80 "$gw_log" >&2 || true
+        exit 2
+      fi
+      log "Gateway ready: http://localhost:${BASE_GATEWAY_PORT}"
     fi
-    log "Gateway ready: http://localhost:${BASE_GATEWAY_PORT}"
 
     log "=== Single run (${prof}) ==="
     local out_dir
@@ -685,13 +719,20 @@ EOF
     fi
     log "Baseline gateway ready: http://localhost:${BASE_GATEWAY_PORT}"
 
-    MEM_GATEWAY_PID="$(start_gateway "$MEM_PROFILE" "$MEM_GATEWAY_PORT" "$MEM_GATEWAY_LOG")"
-    if ! wait_gateway_healthy "$MEM_GATEWAY_PORT" "$MEM_GATEWAY_PID" "$MEM_GATEWAY_LOG"; then
-      echo "ERROR: Mem gateway failed to become healthy. Logs:" >&2
-      tail -80 "$MEM_GATEWAY_LOG" >&2 || true
-      exit 2
+    if [[ "$MRNIAH_MEM9_ISOLATION" == "tenant" ]]; then
+      # Configure the mem profile gateway port/token, but let run_batch.py restart it per case.
+      log "Configuring mem gateway settings for profile=$MEM_PROFILE port=$MEM_GATEWAY_PORT (run_batch.py will manage restarts)"
+      configure_gateway_settings "$MEM_PROFILE" "$MEM_GATEWAY_PORT"
+      log "Mem gateway will be managed per-case by run_batch.py: http://localhost:${MEM_GATEWAY_PORT}"
+    else
+      MEM_GATEWAY_PID="$(start_gateway "$MEM_PROFILE" "$MEM_GATEWAY_PORT" "$MEM_GATEWAY_LOG")"
+      if ! wait_gateway_healthy "$MEM_GATEWAY_PORT" "$MEM_GATEWAY_PID" "$MEM_GATEWAY_LOG"; then
+        echo "ERROR: Mem gateway failed to become healthy. Logs:" >&2
+        tail -80 "$MEM_GATEWAY_LOG" >&2 || true
+        exit 2
+      fi
+      log "Mem gateway ready: http://localhost:${MEM_GATEWAY_PORT}"
     fi
-    log "Mem gateway ready: http://localhost:${MEM_GATEWAY_PORT}"
 
     log "=== Baseline run (${BASE_PROFILE}) ==="
     local base_dir

@@ -27,6 +27,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import atexit
 import http.client
 import json
 import os
@@ -524,15 +525,24 @@ def mem9_clear_memories(
     tenant_id: str,
     agent_id: str,
     max_to_delete: int = 50_000,
-    settle_s: float = 2.0,
+    stable_empty_checks: int = 3,
+    stable_empty_interval_s: float = 1.0,
+    max_duration_s: float = 90.0,
 ) -> Dict[str, Any]:
-    """Delete all tenant memories (best-effort scoped by X-Mnemo-Agent-Id on server side)."""
+    """Delete all tenant memories (best-effort scoped by X-Mnemo-Agent-Id on server side).
+
+    mem9 may add new memories asynchronously (e.g. smart ingest finishing late). To avoid
+    flakiness, we require the list endpoint to be empty for N consecutive checks.
+    """
     start = time.time()
     deleted = 0
     transient_errors = 0
+    empty_streak = 0
 
     # Keep fetching from offset=0 while deleting, because totals/offsets shift.
-    for _ in range(1_000):
+    for _ in range(2_000):
+        if (time.time() - start) > float(max_duration_s):
+            break
         if deleted >= max_to_delete:
             raise RuntimeError(
                 f"mem9 clear exceeded max_to_delete={max_to_delete} (tenant={tenant_id})"
@@ -550,7 +560,13 @@ def mem9_clear_memories(
             raise RuntimeError(f"mem9 list memories missing .memories: {page!r}")
 
         if len(memories) == 0:
-            break
+            empty_streak += 1
+            if empty_streak >= max(1, int(stable_empty_checks)):
+                break
+            time.sleep(float(stable_empty_interval_s))
+            continue
+
+        empty_streak = 0
 
         for m in memories:
             if not isinstance(m, dict):
@@ -578,21 +594,135 @@ def mem9_clear_memories(
                 )
                 time.sleep(1.0)
 
-    # Settle window: agent_end ingest can be async; wait briefly and verify empty.
-    if settle_s > 0:
-        time.sleep(float(settle_s))
-
     final_page = mem9_list_memories(api_url=api_url, tenant_id=tenant_id, agent_id=agent_id)
     final_memories = final_page.get("memories")
     remaining = len(final_memories) if isinstance(final_memories, list) else None
 
     verified = remaining == 0
+    remaining_sample: Optional[List[Dict[str, Any]]] = None
+    if isinstance(final_memories, list) and final_memories:
+        sample: List[Dict[str, Any]] = []
+        for m in final_memories[:10]:
+            if not isinstance(m, dict):
+                continue
+            sample.append(
+                {
+                    "id": m.get("id"),
+                    "agent_id": m.get("agent_id"),
+                    "session_id": m.get("session_id"),
+                    "memory_type": m.get("memory_type"),
+                    "state": m.get("state"),
+                    "created_at": m.get("created_at"),
+                    "updated_at": m.get("updated_at"),
+                }
+            )
+        remaining_sample = sample
     return {
         "deleted": deleted,
         "remaining": remaining,
         "verified": verified,
         "durationMs": int((time.time() - start) * 1000),
         "transientErrors": transient_errors,
+        "remainingSample": remaining_sample,
+    }
+
+
+def mem9_provision_tenant(*, api_url: str) -> str:
+    """Provision a new mem9 tenant/space via POST /v1alpha1/mem9s."""
+    created = http_json(
+        method="POST",
+        url=f"{api_url}/v1alpha1/mem9s",
+        headers={},
+        timeout_s=30,
+        max_attempts=6,
+        retry_base_sleep_s=1.0,
+        retry_max_sleep_s=10.0,
+    )
+    tenant_id = created.get("id") if isinstance(created, dict) else None
+    if not isinstance(tenant_id, str) or not tenant_id.strip():
+        raise RuntimeError(f"mem9 provision did not return .id: {created!r}")
+    return tenant_id.strip()
+
+
+def _http_probe_ok(*, url: str, timeout_s: int = 5) -> bool:
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            code = getattr(resp, "status", None) or resp.getcode()
+            return 200 <= int(code) < 300
+    except Exception:
+        return False
+
+
+def _wait_gateway_healthy(*, port: int, timeout_s: int = 60) -> None:
+    deadline = time.time() + float(timeout_s)
+    url = f"http://localhost:{int(port)}/health"
+    while time.time() < deadline:
+        if _http_probe_ok(url=url, timeout_s=5):
+            return
+        time.sleep(0.5)
+    raise RuntimeError(f"gateway not healthy at {url}")
+
+
+def _start_gateway(*, profile: str, log_path: Path) -> subprocess.Popen[str]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = log_path.open("a", encoding="utf-8")
+    # NOTE: We intentionally do not pass port/token here; those are read from the profile config.
+    proc = subprocess.Popen(
+        ["openclaw", "--profile", profile, "gateway"],
+        stdout=fh,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    # Close our copy of the file handle; the child keeps its own fd.
+    try:
+        fh.close()
+    except Exception:
+        pass
+    return proc
+
+
+def _stop_process(proc: Optional[subprocess.Popen[str]]) -> None:
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        return
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _summarize_memories_page(page: Dict[str, Any]) -> Dict[str, Any]:
+    memories_raw = page.get("memories")
+    memories: List[Dict[str, Any]] = memories_raw if isinstance(memories_raw, list) else []
+    sample: List[Dict[str, Any]] = []
+    for m in memories[:10]:
+        if not isinstance(m, dict):
+            continue
+        sample.append(
+            {
+                "id": m.get("id"),
+                "agent_id": m.get("agent_id"),
+                "session_id": m.get("session_id"),
+                "memory_type": m.get("memory_type"),
+                "state": m.get("state"),
+                "created_at": m.get("created_at"),
+                "updated_at": m.get("updated_at"),
+            }
+        )
+    total = page.get("total")
+    return {
+        "count": len(memories),
+        "total": int(total) if isinstance(total, int) else None,
+        "sample": sample if sample else None,
     }
 
 
@@ -774,6 +904,11 @@ def main() -> int:
         help="If the profile has a mem9 plugin configured, import the session transcript into mem9 before each agent turn.",
     )
     ap.add_argument(
+        "--mem9-provision-per-case",
+        action="store_true",
+        help="When --import-sessions is set, provision a fresh mem9 tenant for each case (one tenant per session-id).",
+    )
+    ap.add_argument(
         "--mem9-clear-memories",
         action="store_true",
         help="When --import-sessions is set, clear all mem9 memories before and after each case (to keep cases independent).",
@@ -787,6 +922,17 @@ def main() -> int:
         "--mem9-tenant-id",
         default="",
         help="mem9 tenant ID (required for --import-sessions unless the profile openclaw.json has a mem9 plugin config).",
+    )
+    ap.add_argument(
+        "--gateway-port",
+        type=int,
+        default=0,
+        help="Gateway port for --profile (required for --mem9-provision-per-case because the gateway is restarted per case).",
+    )
+    ap.add_argument(
+        "--gateway-log",
+        default="",
+        help="Path to append gateway logs when --mem9-provision-per-case is enabled.",
     )
     ap.add_argument(
         "--mem9-import-timeout",
@@ -824,19 +970,42 @@ def main() -> int:
             or os.environ.get("MEM9_TENANT_ID", "").strip()
             or os.environ.get("MNEMO_TENANT_ID", "").strip()
         )
-        if api_url and tenant_id:
-            mem9_cfg = (api_url.rstrip("/"), tenant_id)
-        if mem9_cfg is None:
+        api_url = api_url.rstrip("/") if api_url else ""
+        if not api_url:
             raise SystemExit(
-                "ERROR: --import-sessions requires a mem9 apiUrl + tenantID.\n"
-                "Provide --mem9-api-url/--mem9-tenant-id, or set MEM9_BASE_URL/MEM9_TENANT_ID."
+                "ERROR: --import-sessions requires mem9 apiUrl.\n"
+                "Provide --mem9-api-url, or set MEM9_BASE_URL."
             )
+        if args.mem9_provision_per_case:
+            mem9_cfg = (api_url, "")
+        else:
+            if api_url and tenant_id:
+                mem9_cfg = (api_url, tenant_id)
+            if mem9_cfg is None:
+                raise SystemExit(
+                    "ERROR: --import-sessions requires a mem9 apiUrl + tenantID (unless --mem9-provision-per-case is set).\n"
+                    "Provide --mem9-api-url/--mem9-tenant-id, or set MEM9_BASE_URL/MEM9_TENANT_ID."
+                )
+
+    if args.mem9_provision_per_case:
+        if not args.import_sessions:
+            raise SystemExit("ERROR: --mem9-provision-per-case requires --import-sessions")
+        if not args.gateway_port or args.gateway_port <= 0:
+            raise SystemExit("ERROR: --mem9-provision-per-case requires --gateway-port")
+        if not (args.gateway_log or "").strip():
+            raise SystemExit("ERROR: --mem9-provision-per-case requires --gateway-log")
+        if args.mem9_clear_memories:
+            raise SystemExit("ERROR: --mem9-provision-per-case and --mem9-clear-memories are mutually exclusive")
 
     index_entries = load_index(INDEX)[: args.limit]
 
     pred_path = RESULTS / "predictions.jsonl"
     pred_path.write_text("", encoding="utf-8")
 
+    gateway_proc: Optional[subprocess.Popen[str]] = None
+    gateway_log_path = Path(args.gateway_log).expanduser() if (args.gateway_log or "").strip() else None
+    if args.mem9_provision_per_case:
+        atexit.register(lambda: _stop_process(gateway_proc))
     for entry in index_entries:
         sample_id = entry["id"]
         session_id = entry["session"]
@@ -866,14 +1035,54 @@ def main() -> int:
         mem9_import: Optional[Dict[str, Any]] = None
         mem9_clear_pre: Optional[Dict[str, Any]] = None
         mem9_clear_post: Optional[Dict[str, Any]] = None
+        mem9_tenant_id: Optional[str] = None
         if mem9_cfg is not None:
             api_url, tenant_id = mem9_cfg
+            if args.mem9_provision_per_case:
+                print(f"[{sample_id}] session={session_id} running=mem9_provision", flush=True)
+                mem9_tenant_id = mem9_provision_tenant(api_url=api_url)
+                print(
+                    f"[mem9] provisioned tenant={mem9_tenant_id} session={session_id}",
+                    flush=True,
+                )
+                # Update OpenClaw profile config so the gateway uses this tenant for this case.
+                try:
+                    subprocess.run(
+                        [
+                            "openclaw",
+                            "--profile",
+                            args.profile,
+                            "config",
+                            "set",
+                            "plugins.entries.mem9.config.tenantID",
+                            mem9_tenant_id,
+                        ],
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                except subprocess.CalledProcessError as e:
+                    msg = (e.stderr or e.stdout or "").strip()
+                    raise RuntimeError(f"openclaw config set tenantID failed: {msg}") from e
+                # Restart gateway per case to ensure it picks up the new tenant config.
+                _stop_process(gateway_proc)
+                gateway_proc = None
+                assert gateway_log_path is not None
+                gateway_proc = _start_gateway(profile=args.profile, log_path=gateway_log_path)
+                _wait_gateway_healthy(port=int(args.gateway_port), timeout_s=60)
+                tenant_id = mem9_tenant_id
+
             if args.mem9_clear_memories:
                 print(f"[{sample_id}] session={session_id} running=mem9_clear_pre", flush=True)
                 mem9_clear_pre = mem9_clear_memories(
                     api_url=api_url,
                     tenant_id=tenant_id,
                     agent_id=args.agent,
+                )
+                print(
+                    f"[mem9] clear(pre) deleted={mem9_clear_pre.get('deleted')} remaining={mem9_clear_pre.get('remaining')} verified={mem9_clear_pre.get('verified')}",
+                    flush=True,
                 )
                 if mem9_clear_pre.get("verified") is not True:
                     raise RuntimeError(f"mem9 clear(pre) did not verify empty: {mem9_clear_pre!r}")
@@ -891,6 +1100,16 @@ def main() -> int:
             )
             if mem9_import.get("status") != "done" or mem9_import.get("verified") is not True:
                 raise RuntimeError(f"mem9 import did not complete successfully: {mem9_import!r}")
+            try:
+                memories_page = mem9_list_memories(api_url=api_url, tenant_id=tenant_id, agent_id=args.agent)
+                summary = _summarize_memories_page(memories_page)
+                mem9_import["memoriesAfterImport"] = summary
+                print(
+                    f"[mem9] memories after import count={summary.get('count')} total={summary.get('total')}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[mem9] WARNING: list memories after import failed: {e}", flush=True)
 
         cmd = [
             "openclaw",
@@ -914,18 +1133,7 @@ def main() -> int:
         print(f"[{sample_id}] session={session_id} running=openclaw", flush=True)
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-        if mem9_cfg is not None and args.mem9_clear_memories:
-            api_url, tenant_id = mem9_cfg
-            print(f"[{sample_id}] session={session_id} running=mem9_clear_post", flush=True)
-            mem9_clear_post = mem9_clear_memories(
-                api_url=api_url,
-                tenant_id=tenant_id,
-                agent_id=args.agent,
-            )
-            if mem9_clear_post.get("verified") is not True:
-                raise RuntimeError(f"mem9 clear(post) did not verify empty: {mem9_clear_post!r}")
-
-        # Save raw for debugging
+        # Save raw for debugging as early as possible (even if mem9 cleanup flakes).
         raw_out = RAW / f"{sample_id}-{session_id}.stdout.json"
         raw_err = RAW / f"{sample_id}-{session_id}.stderr.txt"
         raw_out.write_text(proc.stdout, encoding="utf-8")
@@ -996,6 +1204,7 @@ def main() -> int:
                 "runId": extract_run_id(parsed_obj) if parsed_obj is not None else None,
                 "storeKey": resolved_key,
                 "storePath": str(paths.store_path),
+                "mem9TenantId": mem9_tenant_id,
                 "mem9Import": mem9_import,
                 "mem9Clear": {
                     "pre": mem9_clear_pre,
@@ -1038,6 +1247,7 @@ def main() -> int:
                         "answer": answer,
                         "profile": args.profile,
                         "agent": args.agent,
+                        "mem9TenantId": mem9_tenant_id,
                         "mem9ImportTaskId": mem9_import.get("taskId")
                         if isinstance(mem9_import, dict)
                         else None,
@@ -1072,6 +1282,37 @@ def main() -> int:
             f"[{sample_id}] session={session_id} pred_len={len(prediction)} compaction={comp}",
             flush=True,
         )
+
+        if mem9_cfg is not None and args.mem9_clear_memories:
+            api_url, tenant_id = mem9_cfg
+            print(f"[{sample_id}] session={session_id} running=mem9_clear_post", flush=True)
+            mem9_clear_post = mem9_clear_memories(
+                api_url=api_url,
+                tenant_id=tenant_id,
+                agent_id=args.agent,
+            )
+            print(
+                f"[mem9] clear(post) deleted={mem9_clear_post.get('deleted')} remaining={mem9_clear_post.get('remaining')} verified={mem9_clear_post.get('verified')}",
+                flush=True,
+            )
+            # Post-clear is best-effort: async ingest may still be finishing. Pre-clear enforces
+            # isolation before the next case.
+            if mem9_clear_post.get("verified") is not True:
+                print(
+                    f"[mem9] WARNING: clear(post) did not verify empty (will rely on next pre-clear): {mem9_clear_post!r}",
+                    flush=True,
+                )
+            # Backfill into the per-case meta JSON for debugging/reproducibility.
+            try:
+                meta_obj = json.loads(raw_meta.read_text(encoding="utf-8"))
+                if isinstance(meta_obj, dict) and isinstance(meta_obj.get("mem9Clear"), dict):
+                    meta_obj["mem9Clear"]["post"] = mem9_clear_post
+                    raw_meta.write_text(
+                        json.dumps(meta_obj, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+            except Exception:
+                pass
 
     print(f"Wrote predictions -> {pred_path}", flush=True)
     print(f"Raw outputs -> {RAW}", flush=True)
