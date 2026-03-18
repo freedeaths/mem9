@@ -18,7 +18,7 @@ and a small Astro site.
 | `opencode-plugin/`   | OpenCode plugin (`@mem9/opencode`)                           |
 | `claude-plugin/`     | Claude Code plugin (hooks + skills)                          |
 | `docs/design/`       | Architecture/proposal notes and design drafts                |
-| `site/`              | Astro marketing/docs site                                    |
+| `site/`              | Astro static site — deployed to Netlify from `main` branch   |
 | `e2e/`               | Live end-to-end scripts against a running server             |
 | `k8s/`               | Deployment and gateway manifests                             |
 | `benchmark/MR-NIAH/` | Benchmark harness for OpenClaw memory evaluation             |
@@ -59,6 +59,7 @@ cd server && MNEMO_DSN="user:pass@tcp(host:4000)/db?parseTime=true" go run ./cmd
 - `INSERT ... ON DUPLICATE KEY UPDATE` is the expected upsert pattern.
 - Atomic version bump happens in SQL: `SET version = version + 1`.
 - `X-Mnemo-Agent-Id` is the per-agent identity header for memory requests.
+- Always use `make` targets for building and Docker image operations — never construct raw `go build` or `docker build` commands from scratch. Use `make build-linux` for the server binary and `REGISTRY=<ecr> COMMIT=<tag> make docker` for images.
 
 ## Go style
 
@@ -112,6 +113,26 @@ cd server && MNEMO_DSN="user:pass@tcp(host:4000)/db?parseTime=true" go run ./cmd
 | OpenCode wiring      | `opencode-plugin/src/index.ts`              |
 | OpenClaw wiring      | `openclaw-plugin/index.ts`                  |
 | Site copy/content    | `site/src/content/site.ts`                  |
+| Production SKILL.md  | `site/public/SKILL.md`                      |
+| Beta SKILL.md        | `site/public/beta/SKILL.md`                 |
+
+## site/ — Netlify deployment
+
+`/site/` is the deployment directory for the mem9.ai static website.
+It is hosted on Netlify and **automatically deployed from the `main` branch**.
+
+| File | Purpose |
+|---|---|
+| `site/public/SKILL.md` | **Production** SKILL.md — served at `https://mem9.ai/SKILL.md` |
+| `site/public/beta/SKILL.md` | **Beta** SKILL.md — served at `https://mem9.ai/beta/SKILL.md` |
+
+When updating the SKILL.md that agents fetch, edit **only** these two files:
+
+- `site/public/SKILL.md` — production, changes go live within seconds after merging to `main`
+- `site/public/beta/SKILL.md` — beta, same deployment pipeline
+
+Do **not** edit any other copy (e.g. `clawhub-skill/mem9/SKILL.md` has been removed).
+Do **not** manually sync to clawhub — Netlify handles publishing automatically.
 
 ## Hierarchical AGENTS.md files
 
@@ -130,6 +151,23 @@ Use the local file when you work in these areas:
 - `e2e/AGENTS.md`
 - `k8s/AGENTS.md`
 - `benchmark/MR-NIAH/AGENTS.md`
+
+## GitHub access
+
+Prefer `gh` CLI to read GitHub content (issues, PRs, file contents, comments). Fall back
+to `curl` or `webfetch` only when `gh` is unavailable or does not work. Examples:
+
+```bash
+# View a PR
+gh pr view <number>
+
+# Read a file from a specific ref
+gh api repos/{owner}/{repo}/contents/{path}?ref={branch} --jq '.content' | base64 -d
+
+# List issues or PR comments
+gh issue view <number> --comments
+gh pr view <number> --comments
+```
 
 ## Explicitly absent
 

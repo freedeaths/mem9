@@ -120,7 +120,7 @@ func (s *IngestService) Ingest(ctx context.Context, agentName string, req Ingest
 
 	status := "complete"
 	if warnings > 0 && len(insightIDs) == 0 {
-		status = "partial" // Facts extracted but reconciliation failed — no memories written
+		status = "partial"
 	}
 
 	return &IngestResult{
@@ -134,6 +134,61 @@ func (s *IngestService) Ingest(ctx context.Context, agentName string, req Ingest
 // HasLLM returns true if an LLM client is configured for smart processing.
 func (s *IngestService) HasLLM() bool {
 	return s.llm != nil
+}
+
+// Phase1Result holds the output of ExtractPhase1.
+type Phase1Result struct {
+	Facts       []string   // atomic facts extracted from user messages
+	MessageTags [][]string // per-message tags parallel to input messages; missing entries = []
+}
+
+// ExtractPhase1 runs fact extraction and per-message tagging in a single LLM call.
+// Returns an empty Phase1Result (no error) when LLM is nil or messages are empty.
+func (s *IngestService) ExtractPhase1(ctx context.Context, messages []IngestMessage) (*Phase1Result, error) {
+	if s.llm == nil || len(messages) == 0 {
+		return &Phase1Result{}, nil
+	}
+
+	formatted := formatConversation(messages)
+	if formatted == "" {
+		return &Phase1Result{}, nil
+	}
+	const maxConversationRunes = 1000000
+	formatted = truncateRunes(formatted, maxConversationRunes)
+
+	facts, messageTags, err := s.extractFactsAndTags(ctx, formatted, len(messages))
+	if err != nil {
+		return nil, err
+	}
+	return &Phase1Result{Facts: facts, MessageTags: messageTags}, nil
+}
+
+// ReconcilePhase2 runs reconciliation of extracted facts against existing memories.
+// Equivalent to the existing reconcile() pipeline, now exported for use by the handler.
+func (s *IngestService) ReconcilePhase2(ctx context.Context, agentName, agentID, sessionID string, facts []string) (*IngestResult, error) {
+	if len(facts) == 0 {
+		return &IngestResult{Status: "complete"}, nil
+	}
+	const maxFacts = 50
+	if len(facts) > maxFacts {
+		slog.Warn("ReconcilePhase2: truncating facts", "count", len(facts), "max", maxFacts)
+		facts = facts[:maxFacts]
+	}
+	insightIDs, warnings, err := s.reconcile(ctx, agentName, agentID, sessionID, facts)
+	if err != nil {
+		slog.Error("ReconcilePhase2: reconciliation failed", "err", err)
+		return &IngestResult{Status: "failed", Warnings: warnings}, nil
+	}
+	status := "complete"
+	if warnings > 0 && len(insightIDs) == 0 {
+		status = "partial"
+	}
+	return &IngestResult{
+		Status:          status,
+		MemoriesChanged: len(insightIDs),
+		InsightIDs:      insightIDs,
+		Warnings:        warnings,
+	}, nil
 }
 
 // ReconcileContent runs the full ingest pipeline (extract facts + reconcile)
@@ -267,7 +322,8 @@ func (s *IngestService) ingestRaw(ctx context.Context, agentName string, req Ing
 func (s *IngestService) extractAndReconcile(ctx context.Context, agentName, agentID, sessionID, conversation string) ([]string, int, error) {
 	const maxFacts = 50 // Cap extracted facts to bound reconciliation prompt size
 
-	// Phase 1a: Extract facts.
+	// Phase 1a: Extract facts only — no message_tags needed here (smart-ingest / raw-ingest path).
+	// Use extractFacts instead of extractFactsAndTags to avoid wasting tokens on tag generation.
 	facts, err := s.extractFacts(ctx, conversation)
 	if err != nil {
 		return nil, 0, fmt.Errorf("extract facts: %w", err)
@@ -286,12 +342,17 @@ func (s *IngestService) extractAndReconcile(ctx context.Context, agentName, agen
 	return s.reconcile(ctx, agentName, agentID, sessionID, facts)
 }
 
-// extractFacts calls the LLM to extract atomic facts from the conversation.
+// extractFacts calls the LLM to extract atomic facts only, without per-message tag generation.
+// Used by extractAndReconcile (ReconcileContent path) where message_tags are not needed.
 func (s *IngestService) extractFacts(ctx context.Context, conversation string) ([]string, error) {
+	if s.llm == nil || conversation == "" {
+		return nil, nil
+	}
+
 	currentDate := time.Now().Format("2006-01-02")
 
 	systemPrompt := `You are an information extraction engine. Your task is to identify distinct,
-atomic facts from a conversation and return them as a structured JSON array.
+atomic facts from a conversation.
 
 ## Rules
 
@@ -303,39 +364,7 @@ atomic facts from a conversation and return them as a structured JSON array.
 4. Preserve the user's original language. If the user writes in Chinese, extract facts in Chinese.
 5. Omit ephemeral information (greetings, filler, debugging chatter with no lasting value).
 6. Omit information that is only relevant to the current task and has no future reuse value.
-7. If no meaningful facts exist in the conversation, return an empty array.
-
-## Examples
-
-Input:
-User: Hi, how are you?
-Assistant: I'm doing well, thank you! How can I help?
-Output: {"facts": []}
-
-Input:
-User: The weather is nice today.
-Assistant: Indeed it is! Enjoy your day.
-Output: {"facts": []}
-
-Input:
-User: I'm looking for a restaurant in San Francisco.
-Assistant: Sure, what cuisine do you prefer?
-Output: {"facts": ["Looking for a restaurant in San Francisco"]}
-
-Input:
-User: Yesterday I had a meeting with John at 3pm. We discussed the new project timeline.
-Assistant: Sounds productive!
-Output: {"facts": ["Had a meeting with John at 3pm", "Discussed the new project timeline with John"]}
-
-Input:
-User: My name is Ming Zhang, I am a backend engineer, mainly using Go and Python.
-Assistant: Hi Ming Zhang!
-Output: {"facts": ["Name is Ming Zhang", "Is a backend engineer", "Mainly uses Go and Python"]}
-
-Input:
-User: My favorite movies are Inception and Interstellar. I also love Italian food, especially pizza.
-Assistant: Great taste! Both are amazing films.
-Output: {"facts": ["Favorite movies are Inception and Interstellar", "Loves Italian food, especially pizza"]}
+7. If no meaningful facts exist in the conversation, return an empty facts array.
 
 ## Output Format
 
@@ -343,19 +372,19 @@ Return ONLY valid JSON. No markdown fences, no explanation.
 
 {"facts": ["fact one", "fact two", ...]}`
 
-	userPrompt := fmt.Sprintf("Extract facts from this conversation. Today's date is %s.\n\n%s", currentDate, conversation)
+	userPrompt := fmt.Sprintf("Extract facts. Today's date is %s.\n\n%s", currentDate, conversation)
+
+	type extractResponse struct {
+		Facts []string `json:"facts"`
+	}
 
 	raw, err := s.llm.CompleteJSON(ctx, systemPrompt, userPrompt)
 	if err != nil {
 		return nil, fmt.Errorf("extraction LLM call: %w", err)
 	}
 
-	type extractResponse struct {
-		Facts []string `json:"facts"`
-	}
 	parsed, err := llm.ParseJSON[extractResponse](raw)
 	if err != nil {
-		// Retry once.
 		raw2, retryErr := s.llm.CompleteJSON(ctx, systemPrompt,
 			"Your previous response was not valid JSON. Return ONLY the JSON object.\n\n"+userPrompt)
 		if retryErr != nil {
@@ -367,7 +396,6 @@ Return ONLY valid JSON. No markdown fences, no explanation.
 		}
 	}
 
-	// Filter out empty strings.
 	var facts []string
 	for _, f := range parsed.Facts {
 		f = strings.TrimSpace(f)
@@ -375,8 +403,110 @@ Return ONLY valid JSON. No markdown fences, no explanation.
 			facts = append(facts, f)
 		}
 	}
-	slog.Info("facts extracted", "count", len(facts))
+
+	slog.Info("facts extracted", "facts", len(facts))
 	return facts, nil
+}
+
+// extractFactsAndTags calls the LLM to extract atomic facts and per-message tags
+// from the conversation in a single call.
+func (s *IngestService) extractFactsAndTags(ctx context.Context, conversation string, messageCount int) ([]string, [][]string, error) {
+	currentDate := time.Now().Format("2006-01-02")
+
+	systemPrompt := `You are an information extraction engine. Your task is to identify distinct,
+atomic facts from a conversation AND assign short descriptive tags to each message.
+
+## Rules — facts
+
+1. Extract facts ONLY from the user's messages. Ignore assistant and system messages entirely.
+2. Each fact must be a single, self-contained statement (one idea per fact).
+3. Prefer specific details over vague summaries.
+   - Good: "Uses Go 1.22 for backend services"
+   - Bad: "Knows some programming languages"
+4. Preserve the user's original language. If the user writes in Chinese, extract facts in Chinese.
+5. Omit ephemeral information (greetings, filler, debugging chatter with no lasting value).
+6. Omit information that is only relevant to the current task and has no future reuse value.
+7. If no meaningful facts exist in the conversation, return an empty facts array.
+
+## Rules — message_tags
+
+1. Assign 1-3 short lowercase tags to EVERY message (user, assistant, tool, system).
+2. Tags describe the message topic or type. Use your own judgment — there is no fixed vocabulary.
+   Examples: "tech", "work", "personal", "preference", "location", "question",
+   "answer", "tool-call", "tool-result", "error", "code", "debug"
+3. Tags must be lowercase. Use hyphens for multi-word tags: "tool-call", "tool-result".
+4. Return exactly one array entry per message, in the same order as the input conversation.
+   If a message has no meaningful tags, return an empty array [] for it.
+
+## Examples
+
+Input:
+User: Hi, how are you?
+Assistant: I'm doing well, thank you! How can I help?
+Output: {"facts": [], "message_tags": [[], []]}
+
+Input:
+User: My name is Ming Zhang, I am a backend engineer, mainly using Go and Python.
+Assistant: Hi Ming Zhang!
+Output: {"facts": ["Name is Ming Zhang", "Is a backend engineer", "Mainly uses Go and Python"], "message_tags": [["personal", "work", "tech"], ["answer"]]}
+
+Input:
+User: I'm debugging a memory leak in our Go service.
+Assistant: Let's look at the heap profile. Can you share the pprof output?
+User: Here it is: [pprof data...]
+Output: {"facts": ["Debugging a memory leak in a Go service"], "message_tags": [["tech", "debug", "go"], ["tech", "question", "debug"], ["tech", "tool-result", "code"]]}
+
+## Output Format
+
+Return ONLY valid JSON. No markdown fences, no explanation.
+
+{"facts": ["fact one", "fact two", ...], "message_tags": [["tag1", "tag2"], ["tag3"], [], ...]}`
+
+	userPrompt := fmt.Sprintf("Extract facts and assign message tags. Today's date is %s.\n\n%s", currentDate, conversation)
+
+	type extractResponse struct {
+		Facts       []string   `json:"facts"`
+		MessageTags [][]string `json:"message_tags"`
+	}
+
+	raw, err := s.llm.CompleteJSON(ctx, systemPrompt, userPrompt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("extraction LLM call: %w", err)
+	}
+
+	parsed, err := llm.ParseJSON[extractResponse](raw)
+	if err != nil {
+		raw2, retryErr := s.llm.CompleteJSON(ctx, systemPrompt,
+			"Your previous response was not valid JSON. Return ONLY the JSON object.\n\n"+userPrompt)
+		if retryErr != nil {
+			return nil, nil, fmt.Errorf("extraction retry: %w", retryErr)
+		}
+		parsed, err = llm.ParseJSON[extractResponse](raw2)
+		if err != nil {
+			return nil, nil, fmt.Errorf("extraction parse after retry: %w", err)
+		}
+	}
+
+	var facts []string
+	for _, f := range parsed.Facts {
+		f = strings.TrimSpace(f)
+		if f != "" {
+			facts = append(facts, f)
+		}
+	}
+
+	// Normalise message_tags to exactly messageCount entries.
+	messageTags := make([][]string, messageCount)
+	for i := range messageTags {
+		if i < len(parsed.MessageTags) && parsed.MessageTags[i] != nil {
+			messageTags[i] = parsed.MessageTags[i]
+		} else {
+			messageTags[i] = []string{}
+		}
+	}
+
+	slog.Info("facts and tags extracted", "facts", len(facts), "tagged_messages", messageCount)
+	return facts, messageTags, nil
 }
 
 // reconcile searches relevant memories for each fact, deduplicates, then sends
@@ -396,14 +526,21 @@ func (s *IngestService) reconcile(ctx context.Context, agentName, agentID, sessi
 	}
 
 	// Step 2: Map real UUIDs to integer IDs to prevent LLM hallucination.
+	// Include relative age so the LLM can resolve temporal conflicts
+	// (e.g., "Lives in Beijing" from 1 year ago vs new fact "Lives in Shanghai").
 	type memoryRef struct {
 		IntID int    `json:"id"`
 		Text  string `json:"text"`
+		Age   string `json:"age,omitempty"`
 	}
 	refs := make([]memoryRef, len(existingMemories))
 	idMap := make(map[int]string, len(existingMemories))
 	for i, m := range existingMemories {
-		refs[i] = memoryRef{IntID: i, Text: m.Content}
+		ref := memoryRef{IntID: i, Text: m.Content}
+		if !m.UpdatedAt.IsZero() {
+			ref.Age = relativeAge(m.UpdatedAt)
+		}
+		refs[i] = ref
 		idMap[i] = m.ID
 	}
 
@@ -429,28 +566,39 @@ func (s *IngestService) reconcile(ctx context.Context, agentName, agentID, sessi
 5. When the fact covers a topic not in any existing memory, use ADD.
 6. When the fact means the same thing as an existing memory (even if worded differently), use NOOP.
 7. Preserve the language of the original facts. Do not translate.
+8. Each existing memory has an "age" field showing when it was last updated. Use age as a tiebreaker: when a new fact conflicts with an existing memory on the same topic and there is no other signal, older memories are more likely outdated. Age alone is NOT sufficient reason to UPDATE or DELETE — the content must also conflict or supersede the existing memory.
 
 ## Examples
 
 Example 1 — ADD new information:
-  Existing memories: [{"id": 0, "text": "Is a software engineer"}]
+  Existing memories: [{"id": 0, "text": "Is a software engineer", "age": "2 months ago"}]
   New facts: ["Name is John"]
   Result: {"memory": [{"id": "0", "text": "Is a software engineer", "event": "NOOP"}, {"id": "new", "text": "Name is John", "event": "ADD"}]}
 
 Example 2 — UPDATE with more detail:
-  Existing memories: [{"id": 0, "text": "Likes to play cricket"}, {"id": 1, "text": "Is a software engineer"}]
+  Existing memories: [{"id": 0, "text": "Likes to play cricket", "age": "3 weeks ago"}, {"id": 1, "text": "Is a software engineer", "age": "2 months ago"}]
   New facts: ["Loves to play cricket with friends on weekends"]
   Result: {"memory": [{"id": "0", "text": "Loves to play cricket with friends on weekends", "event": "UPDATE", "old_memory": "Likes to play cricket"}, {"id": "1", "text": "Is a software engineer", "event": "NOOP"}]}
 
 Example 3 — DELETE contradicted information:
-  Existing memories: [{"id": 0, "text": "Name is John"}, {"id": 1, "text": "Loves cheese pizza"}]
+  Existing memories: [{"id": 0, "text": "Name is John", "age": "5 months ago"}, {"id": 1, "text": "Loves cheese pizza", "age": "3 months ago"}]
   New facts: ["Dislikes cheese pizza"]
   Result: {"memory": [{"id": "0", "text": "Name is John", "event": "NOOP"}, {"id": "1", "text": "Loves cheese pizza", "event": "DELETE"}, {"id": "new", "text": "Dislikes cheese pizza", "event": "ADD"}]}
 
 Example 4 — NOOP for equivalent information:
-  Existing memories: [{"id": 0, "text": "Name is John"}, {"id": 1, "text": "Loves cheese pizza"}]
+  Existing memories: [{"id": 0, "text": "Name is John", "age": "5 months ago"}, {"id": 1, "text": "Loves cheese pizza", "age": "3 months ago"}]
   New facts: ["Name is John"]
   Result: {"memory": [{"id": "0", "text": "Name is John", "event": "NOOP"}, {"id": "1", "text": "Loves cheese pizza", "event": "NOOP"}]}
+
+Example 5 — Age as tiebreaker for ambiguous conflicts:
+  Existing memories: [{"id": 0, "text": "Prefers vim", "age": "1 year ago"}, {"id": 1, "text": "Works at startup X", "age": "8 months ago"}]
+  New facts: ["Prefers VS Code", "Works at company Y"]
+  Result: {"memory": [{"id": "0", "text": "Prefers VS Code", "event": "UPDATE", "old_memory": "Prefers vim"}, {"id": "1", "text": "Works at company Y", "event": "UPDATE", "old_memory": "Works at startup X"}]}
+
+Example 6 — Age does NOT trigger UPDATE without content conflict:
+  Existing memories: [{"id": 0, "text": "Likes coffee", "age": "2 years ago"}]
+  New facts: ["Enjoys coffee"]
+  Result: {"memory": [{"id": "0", "text": "Likes coffee", "event": "NOOP"}]}
 
 ## Output Format
 
@@ -811,7 +959,11 @@ func (s *IngestService) updateInsight(ctx context.Context, agentName, agentID, s
 	return newID, nil
 }
 
-// stripInjectedContext removes <relevant-memories>...</relevant-memories> tags from messages.
+// StripInjectedContext removes <relevant-memories>...</relevant-memories> tags from messages.
+func StripInjectedContext(messages []IngestMessage) []IngestMessage {
+	return stripInjectedContext(messages)
+}
+
 func stripInjectedContext(messages []IngestMessage) []IngestMessage {
 	result := make([]IngestMessage, 0, len(messages))
 	for _, msg := range messages {

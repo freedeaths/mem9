@@ -48,14 +48,25 @@ func NewUploadTaskRepo(backend string, db *sql.DB) UploadTaskRepo {
 }
 
 // NewMemoryRepo creates a MemoryRepo for the specified backend.
-// autoModel is only used by the tidb backend (for TiDB auto-embedding).
-func NewMemoryRepo(backend string, db *sql.DB, autoModel string, ftsEnabled bool) MemoryRepo {
+// autoModel is used by tidb and db9 backends for auto-embedding features.
+func NewMemoryRepo(backend string, db *sql.DB, autoModel string, ftsEnabled bool, clusterID string) MemoryRepo {
 	switch backend {
 	case "db9":
-		return db9.NewMemoryRepo(db, ftsEnabled)
+		return db9.NewMemoryRepo(db, autoModel, ftsEnabled, clusterID)
 	case "postgres":
-		return postgres.NewMemoryRepo(db, ftsEnabled)
+		return postgres.NewMemoryRepo(db, ftsEnabled, clusterID)
 	default:
-		return tidb.NewMemoryRepo(db, autoModel, ftsEnabled)
+		return tidb.NewMemoryRepo(db, autoModel, ftsEnabled, clusterID)
+	}
+}
+
+// NewSessionRepo creates a SessionRepo. Only supported on the tidb backend.
+// Panics for unsupported backends to surface misconfiguration at startup.
+func NewSessionRepo(backend string, db *sql.DB, autoModel string, ftsEnabled bool, clusterID string) SessionRepo {
+	switch backend {
+	case "tidb", "":
+		return tidb.NewSessionRepo(db, autoModel, ftsEnabled, clusterID)
+	default:
+		panic("NewSessionRepo: unsupported backend " + backend + " (sessions table is TiDB-only)")
 	}
 }

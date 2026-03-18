@@ -44,10 +44,10 @@ func main() {
 		Dims:    cfg.EmbedDims,
 	})
 	if cfg.EmbedAutoModel != "" {
-		if cfg.DBBackend == "tidb" {
-			logger.Info("auto-embedding enabled (TiDB EMBED_TEXT)", "model", cfg.EmbedAutoModel, "dims", cfg.EmbedAutoDims)
+		if cfg.DBBackend == "tidb" || cfg.DBBackend == "db9" {
+			logger.Info("auto-embedding enabled (EMBED_TEXT)", "model", cfg.EmbedAutoModel, "dims", cfg.EmbedAutoDims)
 		} else {
-			logger.Warn("auto-embedding (EMBED_TEXT) is only supported with TiDB; clearing and falling back to client-side embedding", "model", cfg.EmbedAutoModel, "backend", cfg.DBBackend)
+			logger.Warn("auto-embedding (EMBED_TEXT) is only supported with TiDB or db9; clearing and falling back to client-side embedding", "model", cfg.EmbedAutoModel, "backend", cfg.DBBackend)
 			cfg.EmbedAutoModel = ""
 			cfg.EmbedAutoDims = 0
 		}
@@ -82,23 +82,41 @@ func main() {
 	defer tenantPool.Close()
 
 	// Services.
-	var zeroClient *tenant.ZeroClient
+	// Select provisioner based on configuration
+	var provisioner tenant.Provisioner
 	if cfg.TiDBZeroEnabled && cfg.DBBackend == "tidb" {
-		zeroClient = tenant.NewZeroClient(cfg.TiDBZeroAPIURL)
+		// Zero mode (explicit toggle takes precedence)
+		provisioner = tenant.NewZeroProvisioner(cfg.TiDBZeroAPIURL, cfg.DBBackend, cfg.EmbedAutoModel, cfg.EmbedAutoDims, cfg.FTSEnabled)
+		logger.Info("using TiDB Zero provisioner")
 	} else if cfg.TiDBZeroEnabled {
 		logger.Warn("TiDB Zero provisioning is only supported with tidb backend; disabling auto-provisioning", "backend", cfg.DBBackend)
 	}
-	tenantSvc := service.NewTenantService(tenantRepo, zeroClient, tenantPool, logger, cfg.EmbedAutoModel, cfg.EmbedAutoDims, cfg.FTSEnabled)
+
+	// Check for TiDB Cloud credentials (only if Zero is not enabled)
+	if provisioner == nil && cfg.DBBackend == "tidb" {
+		if os.Getenv("MNEMO_TIDBCLOUD_API_KEY") != "" && os.Getenv("MNEMO_TIDBCLOUD_API_SECRET") != "" {
+			provisioner = tenant.NewTiDBCloudProvisioner(cfg.TiDBCloudAPIURL, cfg.TiDBCloudPoolID)
+			logger.Info("using TiDB Cloud Pool provisioner")
+		}
+	}
+
+	// Note: nil provisioner is valid for deployments with pre-existing tenants
+	if provisioner == nil {
+		logger.Info("no provisioner configured (pre-existing tenants mode)")
+	}
+
+	tenantSvc := service.NewTenantService(tenantRepo, provisioner, tenantPool, logger, cfg.EmbedAutoModel, cfg.EmbedAutoDims, cfg.FTSEnabled)
 
 	// Middleware.
 	tenantMW := middleware.ResolveTenant(tenantRepo, tenantPool)
+	apiKeyMW := middleware.ResolveApiKey(tenantRepo, tenantPool)
 	rl := middleware.NewRateLimiter(cfg.RateLimit, cfg.RateBurst)
 	defer rl.Stop()
 	rateMW := rl.Middleware()
 
 	// Handler.
 	srv := handler.NewServer(tenantSvc, uploadTaskRepo, cfg.UploadDir, embedder, llmClient, cfg.EmbedAutoModel, cfg.FTSEnabled, service.IngestMode(cfg.IngestMode), cfg.DBBackend, logger)
-	router := srv.Router(tenantMW, rateMW)
+	router := srv.Router(tenantMW, rateMW, apiKeyMW)
 
 	httpSrv := &http.Server{
 		Addr:         ":" + cfg.Port,

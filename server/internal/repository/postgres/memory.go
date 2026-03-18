@@ -17,10 +17,11 @@ import (
 type MemoryRepo struct {
 	db           *sql.DB
 	ftsAvailable atomic.Bool
+	clusterID    string
 }
 
-func NewMemoryRepo(db *sql.DB, ftsEnabled bool) *MemoryRepo {
-	r := &MemoryRepo{db: db}
+func NewMemoryRepo(db *sql.DB, ftsEnabled bool, clusterID string) *MemoryRepo {
+	r := &MemoryRepo{db: db, clusterID: clusterID}
 	r.ftsAvailable.Store(ftsEnabled)
 	if ftsEnabled {
 		slog.Info("FTS search enabled via MNEMO_FTS_ENABLED")
@@ -189,6 +190,7 @@ func (r *MemoryRepo) List(ctx context.Context, f domain.MemoryFilter) ([]domain.
 	var total int
 	countQuery := "SELECT COUNT(*) FROM memories WHERE " + where
 	if err := r.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+		slog.Error("list memories: count failed", "cluster_id", r.clusterID, "err", err)
 		return nil, 0, fmt.Errorf("count memories: %w", err)
 	}
 
@@ -211,6 +213,7 @@ func (r *MemoryRepo) List(ctx context.Context, f domain.MemoryFilter) ([]domain.
 
 	rows, err := r.db.QueryContext(ctx, dataQuery, dataArgs...)
 	if err != nil {
+		slog.Error("list memories: query failed", "cluster_id", r.clusterID, "err", err)
 		return nil, 0, fmt.Errorf("list memories: %w", err)
 	}
 	defer rows.Close()
@@ -232,6 +235,7 @@ func (r *MemoryRepo) Count(ctx context.Context) (int, error) {
 		`SELECT COUNT(*) FROM memories WHERE state = 'active'`,
 	).Scan(&count)
 	if err != nil {
+		slog.Error("count memories failed", "cluster_id", r.clusterID, "err", err)
 		return 0, fmt.Errorf("count memories: %w", err)
 	}
 	return count, nil
@@ -246,6 +250,7 @@ func (r *MemoryRepo) ListBootstrap(ctx context.Context, limit int) ([]domain.Mem
 		limit,
 	)
 	if err != nil {
+		slog.Error("list bootstrap failed", "cluster_id", r.clusterID, "err", err)
 		return nil, fmt.Errorf("list bootstrap: %w", err)
 	}
 	defer rows.Close()
@@ -297,7 +302,7 @@ func (r *MemoryRepo) VectorSearch(ctx context.Context, queryVec []float32, f dom
 		return nil, nil
 	}
 
-	conds, args := r.buildFilterConds(f)
+	conds, args := r.BuildFilterConds(f)
 	conds = append(conds, "embedding IS NOT NULL")
 
 	// The query vector is the next parameter
@@ -318,6 +323,7 @@ func (r *MemoryRepo) VectorSearch(ctx context.Context, queryVec []float32, f dom
 
 	rows, err := r.db.QueryContext(ctx, query, fullArgs...)
 	if err != nil {
+		slog.Error("vector search failed", "cluster_id", r.clusterID, "err", err)
 		return nil, fmt.Errorf("vector search: %w", err)
 	}
 	defer rows.Close()
@@ -341,7 +347,7 @@ func (r *MemoryRepo) AutoVectorSearch(ctx context.Context, queryText string, f d
 
 // KeywordSearch performs substring search on content.
 func (r *MemoryRepo) KeywordSearch(ctx context.Context, query string, f domain.MemoryFilter, limit int) ([]domain.Memory, error) {
-	conds, args := r.buildFilterConds(f)
+	conds, args := r.BuildFilterConds(f)
 	if query != "" {
 		nextParam := len(args) + 1
 		conds = append(conds, fmt.Sprintf("content ILIKE '%%' || $%d || '%%'", nextParam))
@@ -355,6 +361,7 @@ func (r *MemoryRepo) KeywordSearch(ctx context.Context, query string, f domain.M
 
 	rows, err := r.db.QueryContext(ctx, sqlQuery, args...)
 	if err != nil {
+		slog.Error("keyword search failed", "cluster_id", r.clusterID, "err", err)
 		return nil, fmt.Errorf("keyword search: %w", err)
 	}
 	defer rows.Close()
@@ -372,7 +379,7 @@ func (r *MemoryRepo) KeywordSearch(ctx context.Context, query string, f domain.M
 
 // FTSSearch performs full-text search using PostgreSQL tsvector/tsquery.
 func (r *MemoryRepo) FTSSearch(ctx context.Context, query string, f domain.MemoryFilter, limit int) ([]domain.Memory, error) {
-	conds, args := r.buildFilterConds(f)
+	conds, args := r.BuildFilterConds(f)
 	where := strings.Join(conds, " AND ")
 
 	queryParamIdx := len(args) + 1
@@ -389,7 +396,8 @@ func (r *MemoryRepo) FTSSearch(ctx context.Context, query string, f domain.Memor
 
 	rows, err := r.db.QueryContext(ctx, sqlQuery, fullArgs...)
 	if err != nil {
-		return nil, fmt.Errorf("fts search: %w", err)
+		slog.Error("fts search failed", "cluster_id", r.clusterID, "err", err)
+		return nil, fmt.Errorf("fts search: cluster_id=%s: %w", r.clusterID, err)
 	}
 	defer rows.Close()
 
@@ -407,7 +415,7 @@ func (r *MemoryRepo) FTSSearch(ctx context.Context, query string, f domain.Memor
 // ---- WHERE builder ----
 
 func (r *MemoryRepo) buildWhere(f domain.MemoryFilter) (string, []any) {
-	conds, args := r.buildFilterConds(f)
+	conds, args := r.BuildFilterConds(f)
 	if f.Query != "" {
 		nextParam := len(args) + 1
 		conds = append(conds, fmt.Sprintf("content ILIKE '%%' || $%d || '%%'", nextParam))
@@ -416,7 +424,7 @@ func (r *MemoryRepo) buildWhere(f domain.MemoryFilter) (string, []any) {
 	return strings.Join(conds, " AND "), args
 }
 
-func (r *MemoryRepo) buildFilterConds(f domain.MemoryFilter) ([]string, []any) {
+func (r *MemoryRepo) BuildFilterConds(f domain.MemoryFilter) ([]string, []any) {
 	conds := []string{}
 	args := []any{}
 	paramIdx := 1
