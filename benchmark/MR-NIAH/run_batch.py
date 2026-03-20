@@ -36,6 +36,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -50,6 +51,7 @@ INDEX = OUTPUT / "index.jsonl"
 SESS_OUT = OUTPUT / "sessions"
 META_SUFFIX = ".meta.json"
 PROFILE_MEMORY_DIR = "memory"
+OPENCLAW_DEFAULT_WORKSPACE_DIRNAME = ".openclaw"
 
 
 def now_ms() -> int:
@@ -751,6 +753,39 @@ def resolve_store_paths(profile: str, agent: str) -> StorePaths:
         store_path=store_path,
     )
 
+def resolve_default_openclaw_workspace_dir(profile: str) -> Path:
+    """Best-effort match for OpenClaw's default workspace dir derivation.
+
+    OpenClaw workspaces are stored under ~/.openclaw/workspace[-<profile>].
+    Note: the workspace dir is *not* under the profile's state dir.
+    """
+    base = Path.home() / OPENCLAW_DEFAULT_WORKSPACE_DIRNAME
+    prof = (profile or "").strip()
+    if prof and prof.lower() != "default":
+        return base / f"workspace-{prof}"
+    return base / "workspace"
+
+def rewrite_session_header_cwd(*, session_file: Path, cwd: Path) -> None:
+    """Rewrite only the first JSONL header line to update `cwd`.
+
+    This keeps SessionManager.open() from inheriting an unrelated cwd (often "/")
+    from imported transcripts, which can leak into tool/file behaviors.
+    """
+    tmp = session_file.with_suffix(session_file.suffix + ".tmp")
+    with session_file.open("rb") as src, tmp.open("wb") as dst:
+        first = src.readline()
+        if not first:
+            raise ValueError(f"empty session file: {session_file}")
+        try:
+            header = json.loads(first.decode("utf-8"))
+        except Exception as e:
+            raise ValueError(f"invalid session header JSON: {session_file}") from e
+        if not (isinstance(header, dict) and header.get("type") == "session"):
+            raise ValueError(f"first line is not session header: {session_file}")
+        header["cwd"] = str(cwd)
+        dst.write((json.dumps(header, ensure_ascii=False) + "\n").encode("utf-8"))
+        shutil.copyfileobj(src, dst)
+    tmp.replace(session_file)
 
 def ensure_store_initialized(paths: StorePaths) -> None:
     """Ensure sessions dir & store file exist."""
@@ -839,46 +874,18 @@ def build_session_entry(
     *,
     session_id: str,
     session_file: Path,
-    template: Dict[str, Any],
+    bench_key: str,
 ) -> Dict[str, Any]:
-    entry: Dict[str, Any] = {}
-
-    # Keep only safe/likely fields. We keep skillsSnapshot if present to avoid churn.
-    for field in (
-        "skillsSnapshot",
-        "thinkingLevel",
-        "verboseLevel",
-        "chatType",
-        "deliveryContext",
-        "lastTo",
-        "origin",
-        "lastChannel",
-        "channel",
-    ):
-        if field in template:
-            entry[field] = template[field]
-
-    # New sessions should not inherit compaction / token accounting from any template entry.
-    entry["compactionCount"] = 0
-    for token_field in (
-        "inputTokens",
-        "outputTokens",
-        "totalTokens",
-        "totalTokensFresh",
-        "cacheRead",
-        "cacheWrite",
-        "contextTokens",
-        "memoryFlushAt",
-        "memoryFlushCompactionCount",
-    ):
-        entry.pop(token_field, None)
-
-    entry["sessionId"] = session_id
-    entry["origin"] = "bench:mrniah"
-    # Keep this lightweight; updatedAt is only used for display/sorting in OpenClaw UIs.
-    entry["updatedAt"] = now_ms()
-    entry["sessionFile"] = str(session_file)
-    return entry
+    # Keep this lightweight; updatedAt is primarily used for display/sorting in OpenClaw UIs.
+    return {
+        "sessionId": session_id,
+        "updatedAt": now_ms(),
+        "sessionFile": str(session_file),
+        # Use SessionEntry.label/displayName (string fields) to tag benchmark sessions.
+        # SessionEntry.origin is an object in OpenClaw; do not store a string there.
+        "label": "bench:mrniah",
+        "displayName": bench_key,
+    }
 
 def upsert_store_entry(*, paths: StorePaths, key: str, entry: Dict[str, Any]) -> None:
     store = load_store(paths)
@@ -1200,13 +1207,20 @@ def main() -> int:
 
             # Register into sessions.json under a unique bench key
             bench_key = f"bench:mrniah:{sample_id_int:04d}"
-            store_before = load_store(paths)
-            template = pick_template_entry(store_before)
-            bench_entry = build_session_entry(
-                session_id=session_id,
-                session_file=dst,
-                template=template,
-            )
+            try:
+                rewrite_session_header_cwd(
+                    session_file=dst,
+                    cwd=resolve_default_openclaw_workspace_dir(args.profile),
+                )
+            except Exception as e:
+                # Best-effort: still allow the run, but the session cwd may be less faithful.
+                print(
+                    f"[{sample_id_int}] session={session_id} WARNING: rewrite cwd failed: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            bench_entry = build_session_entry(session_id=session_id, session_file=dst, bench_key=bench_key)
             upsert_store_entry(paths=paths, key=bench_key, entry=bench_entry)
 
             stage = "mem9"

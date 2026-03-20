@@ -497,13 +497,13 @@ summarize_accuracy() {
   echo ""
   echo "======== Accuracy Summary ========"
   echo "--- ${base_label} ---"
-  python3 "$score_script" "${base_path}/predictions.jsonl"
+  python "$score_script" "${base_path}/predictions.jsonl"
   echo ""
   echo "--- ${mem_label} ---"
-  python3 "$score_script" "${mem_path}/predictions.jsonl"
+  python "$score_script" "${mem_path}/predictions.jsonl"
 
   # Print delta using score.py's scoring logic
-  python3 - <<'PY' "$score_script" "$base_path" "$base_label" "$mem_path" "$mem_label"
+  python - <<'PY' "$score_script" "$base_path" "$base_label" "$mem_path" "$mem_label"
 import importlib.util, sys
 from pathlib import Path
 
@@ -685,7 +685,7 @@ main() {
   exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
   log "Logging to $LOG_FILE"
 
-  require_python310
+  # require_python310
   require_cmds "${BASE_CMDS[@]}"
   if [[ "$COMPARE_ONLY" == "1" ]]; then
     local base_dir="$MRNIAH_DIR/results-${BASE_PROFILE}"
