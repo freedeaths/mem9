@@ -73,13 +73,13 @@ SAMPLE_LIMIT=30 ./run_mem_compare.sh --profile mrniah_mem
 To resume a failed single-profile run from a specific sample id (keeps `benchmark/MR-NIAH/results-<profile>/` and appends to `predictions.jsonl`):
 
 ```
-MRNIAH_MEM9_ISOLATION=tenant ./run_mem_compare.sh --profile mrniah_mem --resume 91
+./run_mem_compare.sh --profile mrniah_mem --resume 91
 ```
 
 To re-run a single case (useful for patching up failures after the batch finishes):
 
 ```
-MRNIAH_MEM9_ISOLATION=tenant ./run_mem_compare.sh --profile mrniah_mem --case 91
+./run_mem_compare.sh --profile mrniah_mem --case 91
 ```
 
 By default, the runner continues on per-case failures and records them into `predictions.jsonl`.
@@ -97,9 +97,12 @@ To compare existing runs without re-running (e.g. baseline succeeded earlier, me
 4. Chooses a mem9 isolation strategy via `MRNIAH_MEM9_ISOLATION`:
    - `tenant` (default): provisions a fresh mem9 space per case (strong isolation; recommended).
    - `clear`: provisions one mem9 space for the run and clears memories before/after each case.
-5. Installs the `openclaw-plugin` into the memory profile, adds `plugins.allow=["mem9"]`, and writes the tenant credentials into `plugins.entries.mem9.config`.
-6. Calls `run_batch.py` twice (baseline vs mem), writing into `results-${profile}` for each profile.
-7. Prints accuracy for both runs and the delta.
+5. Chooses a mem9 history load strategy via `MRNIAH_MEM9_LOAD_METHOD`:
+   - `line-write` (default): replays the transcript by posting each JSONL message line to `v1alpha2 /memories` sequentially.
+   - `import-session`: uploads the full transcript via `v1alpha1 /imports` (`file_type=session`) and polls the task.
+6. Installs the `openclaw-plugin` into the memory profile, adds `plugins.allow=["mem9"]`, and writes the tenant credentials into `plugins.entries.mem9.config`.
+7. Calls `run_batch.py` twice (baseline vs mem), writing into `results-${profile}` for baseline and `results-${mem_profile}` for the mem run.
+8. Prints accuracy for both runs and the delta.
 
 Common environment variables:
 
@@ -111,11 +114,23 @@ Common environment variables:
 | `SAMPLE_LIMIT`             | `300`                                         | Samples processed per run (alias: `MRNIAH_LIMIT`).              |
 | `MEM9_BASE_URL`            | `https://api.mem9.ai`                         | mem9 API endpoint used for the comparison run.                  |
 | `MRNIAH_MEM9_ISOLATION`    | `tenant`                                      | mem9 isolation strategy for the mem profile (`tenant` or `clear`). |
+| `MRNIAH_MEM9_LOAD_METHOD`  | `line-write`                                  | mem9 history load strategy for the mem run (`line-write` or `import-session`). |
+| `MRNIAH_MEM9_LINE_WRITE_SLEEP_MS` | `0`                                     | Sleep N ms after each v1alpha2 `/memories` write when `MRNIAH_MEM9_LOAD_METHOD=line-write`. |
+| `MRNIAH_MEM9_LINE_WRITE_VERIFY_TIMEOUT` | `20`                               | Seconds to wait for v1alpha2 recall to observe the written session lines when `MRNIAH_MEM9_LOAD_METHOD=line-write`. |
+| `MRNIAH_MEM9_LINE_WRITE_VERIFY_INTERVAL` | `0.5`                             | Polling interval seconds for write verification when `MRNIAH_MEM9_LOAD_METHOD=line-write`. |
+| `MRNIAH_PARALLEL_RUNS`     | `1`                                           | Set to `0` to run baseline + mem sequentially (more stable; lower API pressure). |
+| `MRNIAH_MEM9_TRACE_LIMIT`  | `5`                                           | Max memories to print per mem9 trace section during the mem run. |
+| `MRNIAH_MEM9_TRACE_CHARS`  | `220`                                         | Max chars per memory content preview in mem9 traces. |
+| `MRNIAH_MEM9_TRACE_QUERY_CHARS` | `800`                                     | Max chars from the question used for mem9 recall preview query. |
 | `MRNIAH_RESET_MEM_PROFILE` | `0`                                           | Set to `1` to recreate the mem profile from the base profile.   |
 | `MRNIAH_CLEAN_SESSIONS`    | `1`                                           | Set to `0` to skip cleaning prior benchmark sessions.           |
 | `MRNIAH_WIPE_AGENT_SESSIONS` | `1`                                         | Set to `0` to avoid wiping `<profile>/agents/<agent>/sessions/` before/after the run (default archives sessions into `results-logs/raw/`). |
 | `MRNIAH_WIPE_LOCAL_MEMORY`  | `1`                                           | Set to `0` to skip wiping the OpenClaw profile's local persistent memory store (`~/.openclaw-<profile>/memory/*`) between cases. |
 | `MRNIAH_OPENCLAW_TIMEOUT`  | `0`                                           | If set, passes `--timeout` to `openclaw agent` via `run_batch`. |
+
+Workspace note:
+
+- The scripts configure each OpenClaw profile to use a benchmark workspace under `~/.openclaw-<profile>/workspace` (not under `~/.openclaw/`).
 
 ### 5. Score predictions
 
@@ -125,7 +140,7 @@ python3 score.py [results/predictions.jsonl] [--max-errors 5]
 
 - Splits each ground-truth answer into key phrases and checks whether each phrase appears as a substring in the model prediction (case-sensitive). The per-sample score is the fraction of matched phrases. Refusal responses are scored as 0.
 - Use `--max-errors` to print mismatched samples for manual inspection.
-- Point the script at the comparison artifacts (`results-mrniah_local/predictions.jsonl`, `results-mrniah_mem/predictions.jsonl`) to evaluate each profile independently.
+- Point the script at the comparison artifacts (`results-mrniah_local/predictions.jsonl`, `results-mrniah_mem/predictions.jsonl`) to evaluate each run independently.
 
 ### Troubleshooting tips
 

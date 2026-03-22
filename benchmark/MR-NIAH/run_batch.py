@@ -38,6 +38,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 import uuid
@@ -112,6 +113,27 @@ def coerce_str(value: Any) -> Optional[str]:
         v = value.strip()
         return v if v else None
     return None
+
+
+def preview_text(value: Any, max_chars: int) -> Optional[str]:
+    if max_chars <= 0:
+        return None
+    if not isinstance(value, str):
+        return None
+    s = value.replace("\n", " ").strip()
+    if not s:
+        return None
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + "..."
+
+
+def truncate_text(value: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return value
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars]
 
 
 def maybe_truncate(text: str, max_chars: int) -> tuple[str, bool]:
@@ -525,6 +547,109 @@ def mem9_list_memories(
     return data
 
 
+def mem9_search_memories(
+    *,
+    api_url: str,
+    tenant_id: str,
+    agent_id: str,
+    query: str,
+    limit: int = 10,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    params = urllib.parse.urlencode(
+        {
+            "q": query,
+            "limit": int(limit),
+            "offset": int(offset),
+        }
+    )
+    url = f"{api_url}/v1alpha1/mem9s/{tenant_id}/memories?{params}"
+    data = http_json(
+        method="GET",
+        url=url,
+        headers={"X-Mnemo-Agent-Id": agent_id},
+        timeout_s=30,
+        max_attempts=6,
+        retry_base_sleep_s=1.0,
+        retry_max_sleep_s=10.0,
+    )
+    if not isinstance(data, dict):
+        raise RuntimeError(f"mem9 search memories returned non-object: {data!r}")
+    return data
+
+
+def mem9v2_create_messages(
+    *,
+    api_url: str,
+    api_key: str,
+    agent_id: str,
+    session_id: str,
+    messages: List[Dict[str, str]],
+) -> Dict[str, Any]:
+    url = f"{api_url}/v1alpha2/mem9s/memories"
+    body = {
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "messages": messages,
+    }
+    data = http_json(
+        method="POST",
+        url=url,
+        headers={
+            "X-Mnemo-Agent-Id": agent_id,
+            "X-API-Key": api_key,
+            "Content-Type": "application/json",
+        },
+        body=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        timeout_s=30,
+        max_attempts=6,
+        retry_base_sleep_s=1.0,
+        retry_max_sleep_s=10.0,
+    )
+    if not isinstance(data, dict):
+        raise RuntimeError(f"mem9 v1alpha2 create returned non-object: {data!r}")
+    return data
+
+
+def mem9v2_search_memories(
+    *,
+    api_url: str,
+    api_key: str,
+    agent_id: str,
+    query: str,
+    limit: int = 10,
+    offset: int = 0,
+    memory_type: str = "",
+    session_id: str = "",
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {
+        "q": query,
+        "limit": int(limit),
+        "offset": int(offset),
+    }
+    if memory_type:
+        params["memory_type"] = memory_type
+    if session_id:
+        params["session_id"] = session_id
+    qs = urllib.parse.urlencode(params)
+    url = f"{api_url}/v1alpha2/mem9s/memories?{qs}"
+    data = http_json(
+        method="GET",
+        url=url,
+        headers={
+            "X-Mnemo-Agent-Id": agent_id,
+            "X-API-Key": api_key,
+        },
+        timeout_s=30,
+        max_attempts=6,
+        retry_base_sleep_s=1.0,
+        retry_max_sleep_s=10.0,
+    )
+    if not isinstance(data, dict):
+        raise RuntimeError(f"mem9 v1alpha2 search returned non-object: {data!r}")
+    return data
+
+
 def mem9_clear_memories(
     *,
     api_url: str,
@@ -713,6 +838,7 @@ def _summarize_memories_page(page: Dict[str, Any]) -> Dict[str, Any]:
     for m in memories[:10]:
         if not isinstance(m, dict):
             continue
+        content_preview = preview_text(m.get("content"), 220)
         sample.append(
             {
                 "id": m.get("id"),
@@ -720,6 +846,10 @@ def _summarize_memories_page(page: Dict[str, Any]) -> Dict[str, Any]:
                 "session_id": m.get("session_id"),
                 "memory_type": m.get("memory_type"),
                 "state": m.get("state"),
+                "tags": m.get("tags"),
+                "source": m.get("source"),
+                "score": m.get("score"),
+                "content_preview": content_preview,
                 "created_at": m.get("created_at"),
                 "updated_at": m.get("updated_at"),
             }
@@ -730,6 +860,19 @@ def _summarize_memories_page(page: Dict[str, Any]) -> Dict[str, Any]:
         "total": int(total) if isinstance(total, int) else None,
         "sample": sample if sample else None,
     }
+
+
+def summarize_memories_page(page: Dict[str, Any], content_preview_chars: int) -> Dict[str, Any]:
+    base = _summarize_memories_page(page)
+    sample = base.get("sample")
+    if not isinstance(sample, list) or content_preview_chars <= 0:
+        return base
+    for rec in sample:
+        if not isinstance(rec, dict):
+            continue
+        if "content_preview" in rec:
+            rec["content_preview"] = preview_text(rec.get("content_preview"), int(content_preview_chars))
+    return base
 
 
 @dataclass
@@ -765,6 +908,46 @@ def resolve_default_openclaw_workspace_dir(profile: str) -> Path:
         return base / f"workspace-{prof}"
     return base / "workspace"
 
+def resolve_profile_workspace_dir(*, profile: str, agent: str, profile_dir: Path) -> Path:
+    """Resolve the effective agent workspace dir for this profile (best-effort).
+
+    OpenClaw chooses workspaces in this order:
+    1) agents.list[].workspace for the selected agent id
+    2) agents.defaults.workspace (for the default agent)
+    3) fallback to ~/.openclaw/workspace[-<profile>]
+
+    We mirror that here so injected transcripts have a `cwd` that matches the
+    gateway's embedded agent workspace.
+    """
+    cfg_path = profile_dir / "openclaw.json"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return resolve_default_openclaw_workspace_dir(profile)
+
+    agents_cfg = cfg.get("agents")
+    if isinstance(agents_cfg, dict):
+        agent_norm = (agent or "").strip().lower()
+        raw_list = agents_cfg.get("list")
+        if agent_norm and isinstance(raw_list, list):
+            for entry in raw_list:
+                if not isinstance(entry, dict):
+                    continue
+                entry_id = entry.get("id")
+                if not isinstance(entry_id, str) or entry_id.strip().lower() != agent_norm:
+                    continue
+                ws = entry.get("workspace")
+                if isinstance(ws, str) and ws.strip():
+                    return Path(ws).expanduser()
+
+        defaults = agents_cfg.get("defaults")
+        if isinstance(defaults, dict):
+            ws = defaults.get("workspace")
+            if isinstance(ws, str) and ws.strip():
+                return Path(ws).expanduser()
+
+    return resolve_default_openclaw_workspace_dir(profile)
+
 def rewrite_session_header_cwd(*, session_file: Path, cwd: Path) -> None:
     """Rewrite only the first JSONL header line to update `cwd`.
 
@@ -786,6 +969,74 @@ def rewrite_session_header_cwd(*, session_file: Path, cwd: Path) -> None:
         dst.write((json.dumps(header, ensure_ascii=False) + "\n").encode("utf-8"))
         shutil.copyfileobj(src, dst)
     tmp.replace(session_file)
+
+
+def _extract_text_blocks(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        chunks: List[str] = []
+        for item in value:
+            if isinstance(item, str):
+                chunks.append(item)
+                continue
+            if isinstance(item, dict):
+                if item.get("type") == "text" and isinstance(item.get("text"), str):
+                    chunks.append(item["text"])
+                    continue
+                for k in ("text", "content", "value", "output"):
+                    if k in item and isinstance(item.get(k), str):
+                        chunks.append(item[k])
+                        break
+        return "".join(chunks)
+    if isinstance(value, dict):
+        for k in ("text", "content", "value", "output"):
+            if k in value:
+                return _extract_text_blocks(value[k])
+    return ""
+
+
+def extract_openclaw_session_messages(session_file: Path) -> List[Dict[str, Any]]:
+    """Extract {role, content, line} from an OpenClaw session transcript JSONL.
+
+    Supports both "simple" {role, content} lines and OpenClaw nested lines:
+      {"type":"message","message":{"role":"...","content":[{"type":"text","text":"..."}]}}
+    """
+    messages: List[Dict[str, Any]] = []
+    with session_file.open("rb") as fh:
+        for line_number, raw in enumerate(fh, start=1):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+
+            role: Optional[str] = None
+            content: str = ""
+
+            if isinstance(obj.get("role"), str):
+                role = obj.get("role")
+                content = _extract_text_blocks(obj.get("content"))
+            elif obj.get("type") == "message" and isinstance(obj.get("message"), dict):
+                msg = obj["message"]
+                if isinstance(msg.get("role"), str):
+                    role = msg.get("role")
+                content = _extract_text_blocks(msg.get("content"))
+
+            if not role:
+                continue
+            role = role.strip()
+            if role in ("system",):
+                continue
+            content = (content or "").strip()
+            if not content:
+                continue
+            messages.append({"role": role, "content": content, "line": line_number})
+    return messages
 
 def ensure_store_initialized(paths: StorePaths) -> None:
     """Ensure sessions dir & store file exist."""
@@ -1045,6 +1296,30 @@ def main() -> int:
         help="mem9 tenant ID (required for --import-sessions unless the profile openclaw.json has a mem9 plugin config).",
     )
     ap.add_argument(
+        "--mem9-load-method",
+        choices=["import-session", "line-write"],
+        default="line-write",
+        help="How to load session history into mem9 when --import-sessions is set (default: line-write).",
+    )
+    ap.add_argument(
+        "--mem9-line-write-sleep-ms",
+        type=int,
+        default=0,
+        help="Sleep N ms after each v1alpha2 /memories write when --mem9-load-method=line-write (default 0).",
+    )
+    ap.add_argument(
+        "--mem9-line-write-verify-timeout",
+        type=float,
+        default=20.0,
+        help="Seconds to wait for v1alpha2 recall to observe the written session lines (default 20).",
+    )
+    ap.add_argument(
+        "--mem9-line-write-verify-interval",
+        type=float,
+        default=0.5,
+        help="Polling interval seconds for write verification when --mem9-load-method=line-write (default 0.5).",
+    )
+    ap.add_argument(
         "--gateway-port",
         type=int,
         default=0,
@@ -1066,6 +1341,24 @@ def main() -> int:
         type=float,
         default=1.0,
         help="Polling interval (seconds) for each mem9 /imports task.",
+    )
+    ap.add_argument(
+        "--mem9-trace-limit",
+        type=int,
+        default=5,
+        help="Max memories to print per trace section (default 5).",
+    )
+    ap.add_argument(
+        "--mem9-trace-chars",
+        type=int,
+        default=220,
+        help="Max chars per memory content preview (default 220).",
+    )
+    ap.add_argument(
+        "--mem9-trace-query-chars",
+        type=int,
+        default=800,
+        help="Max chars from question to use for recall preview query (default 800).",
     )
     args = ap.parse_args()
 
@@ -1210,7 +1503,11 @@ def main() -> int:
             try:
                 rewrite_session_header_cwd(
                     session_file=dst,
-                    cwd=resolve_default_openclaw_workspace_dir(args.profile),
+                    cwd=resolve_profile_workspace_dir(
+                        profile=args.profile,
+                        agent=args.agent,
+                        profile_dir=paths.profile_dir,
+                    ),
                 )
             except Exception as e:
                 # Best-effort: still allow the run, but the session cwd may be less faithful.
@@ -1225,8 +1522,11 @@ def main() -> int:
 
             stage = "mem9"
             mem9_import: Optional[Dict[str, Any]] = None
+            mem9_load_method: str = ""
+            mem9_line_write: Optional[Dict[str, Any]] = None
             mem9_clear_pre: Optional[Dict[str, Any]] = None
             mem9_clear_post: Optional[Dict[str, Any]] = None
+            mem9_recall_preview: Optional[Dict[str, Any]] = None
             mem9_tenant_id: Optional[str] = None
             if mem9_cfg is not None:
                 api_url, tenant_id = mem9_cfg
@@ -1240,24 +1540,31 @@ def main() -> int:
                     )
                     # Update OpenClaw profile config so the gateway uses this tenant for this case.
                     try:
-                        subprocess.run(
-                            [
-                                "openclaw",
-                                "--profile",
-                                args.profile,
-                                "config",
-                                "set",
-                                "plugins.entries.mem9.config.tenantID",
-                                mem9_tenant_id,
-                            ],
-                            check=True,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                        )
+                        # The OpenClaw mem9 plugin treats apiKey as the primary v1alpha2 credential.
+                        # Keep tenantID in sync for backward compatibility / debugging, but always
+                        # set apiKey so the plugin does not keep using a stale placeholder.
+                        for key in (
+                            "plugins.entries.mem9.config.apiKey",
+                            "plugins.entries.mem9.config.tenantID",
+                        ):
+                            subprocess.run(
+                                [
+                                    "openclaw",
+                                    "--profile",
+                                    args.profile,
+                                    "config",
+                                    "set",
+                                    key,
+                                    mem9_tenant_id,
+                                ],
+                                check=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                            )
                     except subprocess.CalledProcessError as e:
                         msg = (e.stderr or e.stdout or "").strip()
-                        raise RuntimeError(f"openclaw config set tenantID failed: {msg}") from e
+                        raise RuntimeError(f"openclaw config set mem9 apiKey failed: {msg}") from e
                     # Restart gateway per case to ensure it picks up the new tenant config.
                     _stop_process(gateway_proc)
                     gateway_proc = None
@@ -1281,32 +1588,192 @@ def main() -> int:
                     if mem9_clear_pre.get("verified") is not True:
                         raise RuntimeError(f"mem9 clear(pre) did not verify empty: {mem9_clear_pre!r}")
 
-                stage = "mem9_import"
-                import_path = raw_dir / f"{sample_id_int}-{session_id}.import.session.jsonl"
-                shutil.copy2(dst, import_path)
-                print(f"[{sample_id_int}] session={session_id} running=mem9_import", flush=True)
-                mem9_import = mem9_import_session(
-                    api_url=api_url,
-                    tenant_id=tenant_id,
-                    agent_id=args.agent,
-                    session_id=session_id,
-                    import_file=import_path,
-                    timeout_s=int(args.mem9_import_timeout),
-                    poll_interval_s=float(args.mem9_import_poll_interval),
-                )
-                if mem9_import.get("status") != "done" or mem9_import.get("verified") is not True:
-                    raise RuntimeError(f"mem9 import did not complete successfully: {mem9_import!r}")
-
-                try:
-                    memories_page = mem9_list_memories(api_url=api_url, tenant_id=tenant_id, agent_id=args.agent)
-                    summary = _summarize_memories_page(memories_page)
-                    mem9_import["memoriesAfterImport"] = summary
+                mem9_load_method = (args.mem9_load_method or "").strip() or "line-write"
+                if mem9_load_method == "import-session":
+                    stage = "mem9_import"
+                    import_path = raw_dir / f"{sample_id_int}-{session_id}.import.session.jsonl"
+                    shutil.copy2(dst, import_path)
+                    print(f"[{sample_id_int}] session={session_id} running=mem9_import", flush=True)
+                    mem9_import = mem9_import_session(
+                        api_url=api_url,
+                        tenant_id=tenant_id,
+                        agent_id=args.agent,
+                        session_id=session_id,
+                        import_file=import_path,
+                        timeout_s=int(args.mem9_import_timeout),
+                        poll_interval_s=float(args.mem9_import_poll_interval),
+                    )
+                    if mem9_import.get("status") != "done" or mem9_import.get("verified") is not True:
+                        raise RuntimeError(f"mem9 import did not complete successfully: {mem9_import!r}")
+                elif mem9_load_method == "line-write":
+                    stage = "mem9_line_write"
+                    start_s = time.time()
+                    extracted = extract_openclaw_session_messages(dst)
+                    total_lines = len(extracted)
+                    posted = 0
+                    failed = 0
+                    first_errors: List[Dict[str, Any]] = []
+                    sleep_ms = max(0, int(args.mem9_line_write_sleep_ms))
                     print(
-                        f"[mem9] memories after import count={summary.get('count')} total={summary.get('total')}",
+                        f"[{sample_id_int}] session={session_id} running=mem9_line_write lines={total_lines}",
                         flush=True,
                     )
+                    for rec in extracted:
+                        role = rec.get("role")
+                        content = rec.get("content")
+                        line_no = rec.get("line")
+                        if not isinstance(role, str) or not isinstance(content, str):
+                            continue
+                        try:
+                            mem9v2_create_messages(
+                                api_url=api_url,
+                                api_key=tenant_id,
+                                agent_id=args.agent,
+                                session_id=session_id,
+                                messages=[{"role": role, "content": content}],
+                            )
+                            posted += 1
+                        except Exception as e:
+                            failed += 1
+                            if len(first_errors) < 5:
+                                first_errors.append(
+                                    {
+                                        "line": line_no,
+                                        "role": role,
+                                        "error": str(e),
+                                    }
+                                )
+                        if sleep_ms > 0:
+                            time.sleep(sleep_ms / 1000.0)
+                    mem9_line_write = {
+                        "linesExtracted": total_lines,
+                        "posted": posted,
+                        "failed": failed,
+                        "sleepMs": sleep_ms,
+                        "durationMs": int((time.time() - start_s) * 1000),
+                        "firstErrors": first_errors if first_errors else None,
+                    }
+
+                    # Best-effort verification: poll until session-scoped recall sees at least one hit.
+                    stage = "mem9_line_write_verify"
+                    verify_start_s = time.time()
+                    attempts = 0
+                    ok = False
+                    preview_query = truncate_text(question, int(args.mem9_trace_query_chars))
+                    timeout_s = max(0.0, float(args.mem9_line_write_verify_timeout))
+                    interval_s = max(0.05, float(args.mem9_line_write_verify_interval))
+                    last_summary: Optional[Dict[str, Any]] = None
+                    while (time.time() - verify_start_s) < timeout_s:
+                        attempts += 1
+                        try:
+                            page = mem9v2_search_memories(
+                                api_url=api_url,
+                                api_key=tenant_id,
+                                agent_id=args.agent,
+                                query=preview_query,
+                                limit=1,
+                                memory_type="session",
+                                session_id=session_id,
+                            )
+                            last_summary = summarize_memories_page(page, int(args.mem9_trace_chars))
+                            if int(last_summary.get("count") or 0) > 0:
+                                ok = True
+                                break
+                        except Exception:
+                            last_summary = None
+                        time.sleep(interval_s)
+                    mem9_line_write["verify"] = {
+                        "ok": ok,
+                        "attempts": attempts,
+                        "durationMs": int((time.time() - verify_start_s) * 1000),
+                        "summary": last_summary,
+                    }
+                else:
+                    raise RuntimeError(f"unsupported mem9 load method: {mem9_load_method!r}")
+
+                # Snapshot "writes" (best-effort): list memories after load (insights/pinned/session search behavior depends on q).
+                try:
+                    memories_page = mem9v2_search_memories(
+                        api_url=api_url,
+                        api_key=tenant_id,
+                        agent_id=args.agent,
+                        query="",
+                        limit=200,
+                    )
+                    summary = summarize_memories_page(memories_page, int(args.mem9_trace_chars))
+                    if mem9_import is not None:
+                        mem9_import["memoriesAfterImport"] = summary
+                    if mem9_line_write is not None:
+                        mem9_line_write["memoriesAfterWrite"] = summary
+                    print(
+                        f"[mem9] memories after load count={summary.get('count')} total={summary.get('total')}",
+                        flush=True,
+                    )
+                    limit = max(0, int(args.mem9_trace_limit))
+                    chars = max(0, int(args.mem9_trace_chars))
+                    sample = summary.get("sample")
+                    if isinstance(sample, list) and sample and limit > 0:
+                        print(f"[mem9] wrote(after load) sample={min(limit, len(sample))}", flush=True)
+                        for rec in sample[:limit]:
+                            if not isinstance(rec, dict):
+                                continue
+                            cid = rec.get("id")
+                            ctype = rec.get("memory_type")
+                            score = rec.get("score")
+                            content_preview = preview_text(rec.get("content_preview"), chars) or ""
+                            print(
+                                f"[mem9] wrote id={cid} type={ctype} score={score} content={content_preview}",
+                                flush=True,
+                            )
                 except Exception as e:
-                    print(f"[mem9] WARNING: list memories after import failed: {e}", flush=True)
+                    print(f"[mem9] WARNING: list memories after load failed: {e}", flush=True)
+                    if mem9_import is not None:
+                        mem9_import["memoriesAfterImportError"] = str(e)
+                    if mem9_line_write is not None:
+                        mem9_line_write["memoriesAfterWriteError"] = str(e)
+
+                # Recall preview (v1alpha2): what a typical prompt query would retrieve.
+                try:
+                    preview_query = truncate_text(question, int(args.mem9_trace_query_chars))
+                    limit = max(1, int(args.mem9_trace_limit))
+                    recall_page = mem9v2_search_memories(
+                        api_url=api_url,
+                        api_key=tenant_id,
+                        agent_id=args.agent,
+                        query=preview_query,
+                        limit=limit,
+                    )
+                    mem9_recall_preview = {
+                        "query": preview_query,
+                        "queryTruncated": bool(len(preview_query) != len(question)),
+                        "page": summarize_memories_page(recall_page, int(args.mem9_trace_chars)),
+                    }
+                    page_summary = mem9_recall_preview["page"]
+                    print(
+                        f"[mem9] recall(pre) q_len={len(preview_query)} count={page_summary.get('count')} total={page_summary.get('total')}",
+                        flush=True,
+                    )
+                    sample = page_summary.get("sample")
+                    chars = max(0, int(args.mem9_trace_chars))
+                    if isinstance(sample, list) and sample and limit > 0:
+                        for rec in sample[:limit]:
+                            if not isinstance(rec, dict):
+                                continue
+                            cid = rec.get("id")
+                            ctype = rec.get("memory_type")
+                            score = rec.get("score")
+                            content_preview = preview_text(rec.get("content_preview"), chars) or ""
+                            print(
+                                f"[mem9] recall id={cid} type={ctype} score={score} content={content_preview}",
+                                flush=True,
+                            )
+                except Exception as e:
+                    print(f"[mem9] WARNING: recall preview failed: {e}", flush=True)
+                    mem9_recall_preview = {
+                        "query": truncate_text(question, int(args.mem9_trace_query_chars)),
+                        "queryTruncated": True,
+                        "error": str(e),
+                    }
 
             stage = "openclaw"
             sent_message = f"/reset {question}" if args.reset else f"/new {question}" if args.new else question
@@ -1385,7 +1852,10 @@ def main() -> int:
                     "storeKey": resolved_key,
                     "storePath": str(paths.store_path),
                     "mem9TenantId": mem9_tenant_id,
+                    "mem9LoadMethod": mem9_load_method or None,
                     "mem9Import": mem9_import,
+                    "mem9LineWrite": mem9_line_write,
+                    "mem9RecallPreview": mem9_recall_preview,
                     "mem9Clear": {
                         "pre": mem9_clear_pre,
                         "post": mem9_clear_post,
@@ -1439,11 +1909,14 @@ def main() -> int:
                     "stderrPath": str(raw_err),
                     "metaPath": str(raw_meta),
                     "mem9TenantId": mem9_tenant_id,
+                    "mem9LoadMethod": mem9_load_method or None,
                     "mem9ImportTaskId": mem9_import.get("taskId") if isinstance(mem9_import, dict) else None,
                     "mem9ImportStatus": mem9_import.get("status") if isinstance(mem9_import, dict) else None,
                     "mem9ImportVerified": mem9_import.get("verified") if isinstance(mem9_import, dict) else None,
                     "mem9ImportTotalChunks": mem9_import.get("totalChunks") if isinstance(mem9_import, dict) else None,
                     "mem9ImportDoneChunks": mem9_import.get("doneChunks") if isinstance(mem9_import, dict) else None,
+                    "mem9LineWritePosted": mem9_line_write.get("posted") if isinstance(mem9_line_write, dict) else None,
+                    "mem9LineWriteFailed": mem9_line_write.get("failed") if isinstance(mem9_line_write, dict) else None,
                     "compactionTriggered": compaction["compactionTriggered"],
                     "compactionCountDelta": compaction["compactionCountDelta"],
                     "compactionCountAfter": compaction["compactionCountAfter"],

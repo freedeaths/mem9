@@ -39,10 +39,28 @@ MRNIAH_CLEAN_SESSIONS="${MRNIAH_CLEAN_SESSIONS:-1}"
 MRNIAH_WIPE_AGENT_SESSIONS="${MRNIAH_WIPE_AGENT_SESSIONS:-1}"
 MRNIAH_WIPE_LOCAL_MEMORY="${MRNIAH_WIPE_LOCAL_MEMORY:-1}"
 
+# Speed vs stability:
+# - 0: run baseline then mem sequentially (more stable; lower API pressure).
+# - 1 (default): run baseline and mem in parallel (faster; higher API/QPS pressure).
+MRNIAH_PARALLEL_RUNS="${MRNIAH_PARALLEL_RUNS:-1}"
+
+# run_batch.py prints mem9 debug info (writes + recall preview) during the mem run.
+MRNIAH_MEM9_TRACE_LIMIT="${MRNIAH_MEM9_TRACE_LIMIT:-5}"
+MRNIAH_MEM9_TRACE_CHARS="${MRNIAH_MEM9_TRACE_CHARS:-220}"
+MRNIAH_MEM9_TRACE_QUERY_CHARS="${MRNIAH_MEM9_TRACE_QUERY_CHARS:-800}"
+
 # mem9 isolation strategy for the mem-enabled profile:
 # - "clear": reuse one tenant and clear memories pre/post each case
 # - "tenant": provision a fresh tenant per case (strong isolation; recommended)
 MRNIAH_MEM9_ISOLATION="${MRNIAH_MEM9_ISOLATION:-tenant}"
+
+# How to load session history into mem9 for the mem profile:
+# - import-session: v1alpha1 /imports (file_type=session) with task polling
+# - line-write: v1alpha2 /memories, write each JSONL message line sequentially
+MRNIAH_MEM9_LOAD_METHOD="${MRNIAH_MEM9_LOAD_METHOD:-line-write}"
+MRNIAH_MEM9_LINE_WRITE_SLEEP_MS="${MRNIAH_MEM9_LINE_WRITE_SLEEP_MS:-0}"
+MRNIAH_MEM9_LINE_WRITE_VERIFY_TIMEOUT="${MRNIAH_MEM9_LINE_WRITE_VERIFY_TIMEOUT:-20}"
+MRNIAH_MEM9_LINE_WRITE_VERIFY_INTERVAL="${MRNIAH_MEM9_LINE_WRITE_VERIFY_INTERVAL:-0.5}"
 
 # If set to 1, the mem profile will be regenerated from the base profile before running.
 MRNIAH_RESET_MEM_PROFILE="${MRNIAH_RESET_MEM_PROFILE:-0}"
@@ -81,6 +99,10 @@ Notes:
 - Set MRNIAH_OPENCLAW_TIMEOUT=<seconds> to force an explicit openclaw agent timeout.
 - Set MRNIAH_MEM9_ISOLATION=tenant (default) to provision a fresh mem9 tenant per case.
 - Set MRNIAH_MEM9_ISOLATION=clear to reuse one tenant and clear memories per case.
+- Set MRNIAH_PARALLEL_RUNS=0 to run baseline then mem sequentially (more stable).
+- Set MRNIAH_MEM9_LOAD_METHOD=import-session to switch mem9 history loading strategy.
+- Optional: tune trace verbosity via MRNIAH_MEM9_TRACE_LIMIT / MRNIAH_MEM9_TRACE_CHARS.
+- Optional: tune recall preview query length via MRNIAH_MEM9_TRACE_QUERY_CHARS.
 - By default, uses hosted mem9 at https://api.mem9.ai (override via MEM9_BASE_URL).
 - This script starts two OpenClaw gateways (baseline + mem) on separate ports.
 EOF
@@ -377,10 +399,13 @@ EOF
 
 setup_workspace() {
   local profile="$1"
-  local ws_dir="$HOME/.openclaw/workspace-${profile}"
+  local ws_dir="$HOME/.openclaw-${profile}/workspace"
   rm -rf "$ws_dir"
   mkdir -p "$ws_dir"
   cp -r "$ROOT/benchmark/workspace/." "$ws_dir/"
+  # Ensure the OpenClaw profile actually uses the benchmark workspace directory.
+  # (Some profiles pin agents.defaults.workspace to ~/.openclaw-<profile>/workspace.)
+  openclaw --profile "$profile" config set agents.defaults.workspace "$ws_dir" >/dev/null
   log "Copied workspace files to $ws_dir"
 }
 
@@ -430,7 +455,7 @@ configure_mem_profile() {
 run_batch_for_profile() {
   local profile="$1"
   local label="$2"
-  local out_dir="$MRNIAH_DIR/results-${label}"
+  local out_dir="$MRNIAH_DIR/results-${profile}"
 
   log "Running run_batch.py for profile=$profile (label=$label)"
   if [[ "${MRNIAH_WIPE_AGENT_SESSIONS}" == "0" ]]; then
@@ -441,6 +466,17 @@ run_batch_for_profile() {
   else
     rm -rf "$out_dir"
   fi
+  mkdir -p "$out_dir"
+  cat >"${out_dir}/run_info.json" <<EOF
+{
+  "runId": "${RUN_ID}",
+  "profile": "${profile}",
+  "label": "${label}",
+  "mem9Isolation": "${MRNIAH_MEM9_ISOLATION}",
+  "mem9LoadMethod": "${MRNIAH_MEM9_LOAD_METHOD}",
+  "startedAtUtc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
 
   # Use -u to avoid Python stdout buffering when output is piped through tee.
   local cmd=(python3 -u run_batch.py --profile "$profile" --agent "$AGENT_NAME" --limit "$SAMPLE_LIMIT" --results-dir "$out_dir")
@@ -457,6 +493,7 @@ run_batch_for_profile() {
   fi
   if [[ "$profile" == "$MEM_PROFILE" ]]; then
     cmd+=(--import-sessions --mem9-api-url "$MEM9_BASE_URL")
+    cmd+=(--mem9-load-method "$MRNIAH_MEM9_LOAD_METHOD")
     if [[ "$MRNIAH_MEM9_ISOLATION" == "clear" ]]; then
       cmd+=(--mem9-clear-memories --mem9-tenant-id "$MEM9_SPACE_ID")
     elif [[ "$MRNIAH_MEM9_ISOLATION" == "tenant" ]]; then
@@ -465,6 +502,14 @@ run_batch_for_profile() {
       echo "ERROR: Invalid MRNIAH_MEM9_ISOLATION=$MRNIAH_MEM9_ISOLATION (expected: tenant|clear)" >&2
       exit 2
     fi
+    if [[ "$MRNIAH_MEM9_LOAD_METHOD" == "line-write" ]]; then
+      cmd+=(--mem9-line-write-sleep-ms "$MRNIAH_MEM9_LINE_WRITE_SLEEP_MS")
+      cmd+=(--mem9-line-write-verify-timeout "$MRNIAH_MEM9_LINE_WRITE_VERIFY_TIMEOUT")
+      cmd+=(--mem9-line-write-verify-interval "$MRNIAH_MEM9_LINE_WRITE_VERIFY_INTERVAL")
+    fi
+    cmd+=(--mem9-trace-limit "$MRNIAH_MEM9_TRACE_LIMIT")
+    cmd+=(--mem9-trace-chars "$MRNIAH_MEM9_TRACE_CHARS")
+    cmd+=(--mem9-trace-query-chars "$MRNIAH_MEM9_TRACE_QUERY_CHARS")
   fi
   if [[ "${MRNIAH_OPENCLAW_TIMEOUT}" != "0" ]]; then
     cmd+=(--openclaw-timeout "$MRNIAH_OPENCLAW_TIMEOUT")
@@ -497,13 +542,13 @@ summarize_accuracy() {
   echo ""
   echo "======== Accuracy Summary ========"
   echo "--- ${base_label} ---"
-  python "$score_script" "${base_path}/predictions.jsonl"
+  python3 "$score_script" "${base_path}/predictions.jsonl"
   echo ""
   echo "--- ${mem_label} ---"
-  python "$score_script" "${mem_path}/predictions.jsonl"
+  python3 "$score_script" "${mem_path}/predictions.jsonl"
 
   # Print delta using score.py's scoring logic
-  python - <<'PY' "$score_script" "$base_path" "$base_label" "$mem_path" "$mem_label"
+  python3 - <<'PY' "$score_script" "$base_path" "$base_label" "$mem_path" "$mem_label"
 import importlib.util, sys
 from pathlib import Path
 
@@ -685,10 +730,14 @@ main() {
   exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
   log "Logging to $LOG_FILE"
 
-  # require_python310
+  require_python310
   require_cmds "${BASE_CMDS[@]}"
   if [[ "$COMPARE_ONLY" == "1" ]]; then
     local base_dir="$MRNIAH_DIR/results-${BASE_PROFILE}"
+    local mem_label="$MEM_PROFILE"
+    if [[ "$MRNIAH_MEM9_LOAD_METHOD" != "import-session" ]]; then
+      mem_label="${MEM_PROFILE}-${MRNIAH_MEM9_LOAD_METHOD}"
+    fi
     local mem_dir="$MRNIAH_DIR/results-${MEM_PROFILE}"
     if [[ ! -f "${base_dir}/predictions.jsonl" ]]; then
       echo "ERROR: Missing baseline predictions at ${base_dir}/predictions.jsonl" >&2
@@ -700,7 +749,7 @@ main() {
       echo "Hint: run mem first, e.g. ./run_mem_compare.sh --profile ${MEM_PROFILE}" >&2
       exit 2
     fi
-    summarize_accuracy "$base_dir" "$BASE_PROFILE" "$mem_dir" "$MEM_PROFILE"
+    summarize_accuracy "$base_dir" "$BASE_PROFILE" "$mem_dir" "$mem_label"
     cat <<EOF
 
 Artifacts:
@@ -761,6 +810,7 @@ EOF
 
   if [[ -n "$RUN_ONLY_PROFILE" ]]; then
     local prof="$RUN_ONLY_PROFILE"
+    local label="$prof"
     local gw_log="${LOG_DIR}/gateway_${prof}_${BASE_GATEWAY_PORT}.log"
     BASE_GATEWAY_LOG="$gw_log"
     if [[ "$prof" == "$MEM_PROFILE" && "$MRNIAH_MEM9_ISOLATION" == "tenant" ]]; then
@@ -781,11 +831,11 @@ EOF
 
     log "=== Single run (${prof}) ==="
     local out_dir
-    out_dir="$(run_batch_for_profile "$prof" "$prof")"
+    out_dir="$(run_batch_for_profile "$prof" "$label")"
 
     echo ""
     echo "======== Accuracy Summary ========"
-    python "$MRNIAH_DIR/score.py" "${out_dir}/predictions.jsonl"
+    python3 "$MRNIAH_DIR/score.py" "${out_dir}/predictions.jsonl"
 
     cat <<EOF
 
@@ -818,15 +868,49 @@ EOF
       log "Mem gateway ready: http://localhost:${MEM_GATEWAY_PORT}"
     fi
 
-    log "=== Baseline run (${BASE_PROFILE}) ==="
     local base_dir
-    base_dir="$(run_batch_for_profile "$BASE_PROFILE" "$BASE_PROFILE")"
-
-    log "=== Mem run (${MEM_PROFILE}) ==="
     local mem_dir
-    mem_dir="$(run_batch_for_profile "$MEM_PROFILE" "$MEM_PROFILE")"
+    local mem_label="$MEM_PROFILE"
+    if [[ "$MRNIAH_MEM9_LOAD_METHOD" != "import-session" ]]; then
+      mem_label="${MEM_PROFILE}-${MRNIAH_MEM9_LOAD_METHOD}"
+    fi
+    log "=== Baseline run (${BASE_PROFILE}) ==="
+    if [[ "${MRNIAH_PARALLEL_RUNS}" != "0" ]]; then
+      log "=== Parallel run: baseline + mem ==="
+      local base_dir_file
+      local mem_dir_file
+      base_dir_file="$(mktemp)"
+      mem_dir_file="$(mktemp)"
 
-    summarize_accuracy "$base_dir" "$BASE_PROFILE" "$mem_dir" "$MEM_PROFILE"
+      (run_batch_for_profile "$BASE_PROFILE" "$BASE_PROFILE" >"$base_dir_file") &
+      local base_job=$!
+      (run_batch_for_profile "$MEM_PROFILE" "$mem_label" >"$mem_dir_file") &
+      local mem_job=$!
+
+      local base_ok=1
+      local mem_ok=1
+      if ! wait "$base_job"; then
+        base_ok=0
+      fi
+      if ! wait "$mem_job"; then
+        mem_ok=0
+      fi
+      base_dir="$(cat "$base_dir_file" 2>/dev/null || true)"
+      mem_dir="$(cat "$mem_dir_file" 2>/dev/null || true)"
+      rm -f "$base_dir_file" "$mem_dir_file" >/dev/null 2>&1 || true
+
+      if [[ "$base_ok" != "1" || "$mem_ok" != "1" ]]; then
+        echo "ERROR: parallel run failed (baseline_ok=$base_ok mem_ok=$mem_ok)" >&2
+        exit 2
+      fi
+    else
+      base_dir="$(run_batch_for_profile "$BASE_PROFILE" "$BASE_PROFILE")"
+
+      log "=== Mem run (${mem_label}) ==="
+      mem_dir="$(run_batch_for_profile "$MEM_PROFILE" "$mem_label")"
+    fi
+
+    summarize_accuracy "$base_dir" "$BASE_PROFILE" "$mem_dir" "$mem_label"
 
     cat <<EOF
 
