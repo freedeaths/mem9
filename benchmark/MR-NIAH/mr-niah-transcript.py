@@ -585,6 +585,11 @@ def main() -> int:
     )
     ap.add_argument("--limit", type=int, default=0, help="Stop after N samples (0 = all)")
     ap.add_argument(
+        "--output-dir",
+        default="",
+        help="Write outputs under this directory (expects <dir>/sessions/ and <dir>/index.jsonl). Default: benchmark/MR-NIAH/output/",
+    )
+    ap.add_argument(
         "--usage-mode",
         choices=["per-call", "per-message"],
         default="per-call",
@@ -603,6 +608,17 @@ def main() -> int:
         help="Extra tokens to add per message when estimating call prompt size (approx chat serialization overhead).",
     )
     args = ap.parse_args()
+
+    output_dir = (args.output_dir or "").strip()
+    if output_dir:
+        p = Path(output_dir).expanduser()
+        if not p.is_absolute():
+            p = (HERE / p)
+        out_path = p.resolve()
+        global OUTPUT, SESS_DIR, INDEX_PATH
+        OUTPUT = out_path
+        SESS_DIR = OUTPUT / "sessions"
+        INDEX_PATH = OUTPUT / "index.jsonl"
 
     inputs = gather_inputs(args.inputs, args.extra_inputs, args.lang, args.tokens)
 

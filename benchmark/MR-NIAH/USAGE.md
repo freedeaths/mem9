@@ -6,10 +6,51 @@ This document explains how to prepare an OpenClaw profile, set up the required d
 
 ### OpenClaw profiles
 
-1. Pick a baseline profile name (defaults to `mrniah_local` throughout the scripts) and initialize it with the OpenClaw CLI so that `~/.openclaw-<profile>/openclaw.json` exists.
-2. Ensure the profile includes at least one agent (default: `main`) because `run_batch.py` and `run_mem_compare.sh` drop regenerated transcripts into `<profile>/agents/<agent>/sessions/` and update `sessions.json` automatically.
-3. When you plan to run comparisons, keep the baseline profile pristine. The comparison script clones it to `~/.openclaw-${MRNIAH_MEM_PROFILE}` (default `mrniah_mem`) before installing the mem9 plugin, so everything that should be shared—API keys, transports, tools—must already live in the baseline directory.
-4. If you are working from an existing team profile, copy the entire folder into `~/.openclaw-<profile>` (or let the CLI initialize it) before you start the pipeline; the scripts never copy data back into the repo.
+There are two ways to run:
+
+1) **Full baseline-vs-mem comparison (recommended)**: `run_mem_compare.sh` defaults to managed profiles and recreates fresh OpenClaw profiles per run from `benchmark/MR-NIAH/config/openclaw/`. You do not need to manually initialize `~/.openclaw-<profile>` beforehand.
+
+2) **Single-profile batch runs** (e.g. calling `run_batch.py` directly): initialize your profile with the OpenClaw CLI so that `~/.openclaw-<profile>/openclaw.json` exists.
+
+#### (Optional) Managed profiles (template + .env)
+
+If you do not want to manually maintain two profiles (baseline + mem) and risk configuration drift (e.g. compaction settings), `run_mem_compare.sh` can recreate profiles from a template directory each run.
+
+For full baseline-vs-mem comparisons, managed profiles are enabled by default to avoid accidental reuse of existing profiles. If you do not pass `--base-profile/--mem-profile`, the runner appends a `_yyyymmddhhmmss` suffix automatically.
+
+Requirements:
+
+- A template directory that contains at least an `openclaw.json` (it can also include `agents/`, `workspace/`, etc).
+- An `.env` file that contains your secret API keys and any other required environment variables.
+  - The runner treats it as opaque and never prints it.
+  - `.env` is gitignored.
+
+Default locations (in this repo):
+
+- Template dir: `benchmark/MR-NIAH/config/openclaw/` (must contain `openclaw.json`)
+- Env file: `benchmark/MR-NIAH/config/openclaw/.env`
+
+Setup:
+
+1) Copy `example.env` to `.env`:
+
+```
+cp benchmark/MR-NIAH/config/openclaw/example.env benchmark/MR-NIAH/config/openclaw/.env
+```
+
+2) Edit `benchmark/MR-NIAH/config/openclaw/.env` to set your keys.
+
+3) Ensure `benchmark/MR-NIAH/config/openclaw/openclaw.json` references the same variable names (it typically uses `${ENV_VAR}` placeholders).
+
+Example (recreate baseline + mem from a local template, set model + compaction preset):
+
+```
+./run_mem_compare.sh \
+  --model "dashscope/qwen3.5-plus" \
+  --compact "safeguard-20k"
+```
+
+Compaction presets live under `benchmark/MR-NIAH/openclaw/compact/` (a default `safeguard-20k` preset is included).
 
 ### Software and infrastructure
 
@@ -18,7 +59,7 @@ This document explains how to prepare an OpenClaw profile, set up the required d
 | Python 3.10+ & pip                                                        | Runs `fetch_data.py`, `mr-niah-transcript.py`, `run_batch.py`, and `score.py`.                  | Install dependencies with `python3 -m pip install -r requirements.txt` from the repo root if available, or install `requests`, `click`, and `rich` manually. |
 | Git + network access to MiniMax’s MR-NIAH repo                            | `fetch_data.py` mirrors upstream datasets via GitHub.                                           | Works with anonymous HTTPS; provide a token if your network requires it.                                                                                     |
 | OpenClaw CLI (latest)                                                     | Executes agents for each regenerated session.                                                   | Verify `openclaw --version` works and that the CLI can run your chosen profile interactively.                                                                |
-| Access to the hosted mem9 API (or another mem9-compatible endpoint)       | Stores mem9 state whenever you run the comparison flow.                                         | By default the script uses `https://api.mem9.ai`; set `MEM9_BASE_URL` if you want a different endpoint.                                                      |
+| Access to the hosted mem9 API (or another mem9-compatible endpoint)       | Stores mem9 state whenever you run the comparison flow.                                         | By default the script uses `https://api.mem9.ai`; pass `--mem9-base-url` if you want a different endpoint.                                                   |
 
 ## Pipeline
 
@@ -43,6 +84,11 @@ python3 mr-niah-transcript.py [--lang LANG] [--tokens BUCKET ...] [--input FILE 
   - `output/sessions/<uuid>.jsonl` – session history ready for OpenClaw.
   - `output/index.jsonl` – metadata that downstream steps consume.
 - The defaults read all files in `origin/` if present; pass explicit files with `--input` or disable auto-selection via `--lang none`.
+- If `benchmark/MR-NIAH/output/` is not writable (or you want to keep it immutable), write transcripts somewhere else:
+
+```
+python3 mr-niah-transcript.py --output-dir /tmp/mrniah-output
+```
 
 ### 3. Run OpenClaw batches
 
@@ -55,19 +101,26 @@ python3 run_batch.py --profile mrniah_local --agent main --limit 30
   - `--profile` – target OpenClaw profile (must already exist as described above).
   - `--agent` – agent directory name inside the profile. Defaults to `main`.
   - `--limit` – cap the number of MR-NIAH samples processed.
+  - `--output-dir` – where to read `index.jsonl` and `sessions/*.jsonl` from (default: `output/`).
   - `--import-sessions` – uploads the session transcript to mem9 via `/imports` before each agent turn. Requires mem9 tenant details via `--mem9-api-url/--mem9-tenant-id` (or env vars / profile config).
 - Artifacts land in `results/predictions.jsonl` plus `results/raw/*.stdout.json` / `.stderr.txt`.
 
 ### 4. (Optional) Baseline vs mem9 comparison
 
 ```
-SAMPLE_LIMIT=30 ./run_mem_compare.sh
+./run_mem_compare.sh --limit 30
+```
+
+If you generated transcripts into a non-default output directory, pass the same location to the runner:
+
+```
+./run_mem_compare.sh --output-dir /tmp/mrniah-output --limit 10
 ```
 
 To rerun only one side (useful when baseline already exists and you just want to retry the mem9 run):
 
 ```
-SAMPLE_LIMIT=30 ./run_mem_compare.sh --profile mrniah_mem
+./run_mem_compare.sh --profile mrniah_mem --limit 30
 ```
 
 To resume a failed single-profile run from a specific sample id (keeps `benchmark/MR-NIAH/results-<profile>/` and appends to `predictions.jsonl`):
@@ -91,42 +144,42 @@ To compare existing runs without re-running (e.g. baseline succeeded earlier, me
 ./run_mem_compare.sh --compare
 ```
 
+#### Common options
+
+- `--model <provider/model>`: sets `agents.defaults.model.primary` for both baseline + mem profiles.
+- `--compact <preset|path.json>`: applies a compaction preset to both baseline + mem profiles (`agents.defaults.contextTokens` + `agents.defaults.compaction`).
+- `--model-context-window <n>`: best-effort patch of the selected model catalog entry in `openclaw.json` (`models.providers.*.models[].contextWindow`). This is only applied when the profile `openclaw.json` contains a matching model entry.
+- `--mem9-base-url <url>`: overrides the default mem9 base URL for this run.
+
+#### Post-processing (archive)
+
+When you run a full baseline-vs-mem comparison (not `--profile`, not `--compare`, not `--case`, not `--resume`) and the script completes successfully, it automatically creates a tarball in `results-logs/` containing:
+
+- both `results-<profile>/` directories
+- the main compare log file
+
 1. Verifies `output/index.jsonl` exists (generate it if missing).
-2. Creates `~/.openclaw-${MRNIAH_MEM_PROFILE}` by cloning `~/.openclaw-${MRNIAH_BASE_PROFILE}` when the mem profile is missing, or when you export `MRNIAH_RESET_MEM_PROFILE=1`.
-3. Uses the hosted mem9 API by default (`https://api.mem9.ai`), or the endpoint you provide via `MEM9_BASE_URL` (aliases: `MEM9_API_URL`, `MNEMO_API_URL`).
-4. Chooses a mem9 isolation strategy via `MRNIAH_MEM9_ISOLATION`:
+2. Creates `~/.openclaw-<mem-profile>` by cloning `~/.openclaw-<base-profile>` when the mem profile is missing, or when you pass `--reset-mem-profile`.
+3. Uses the hosted mem9 API by default (`https://api.mem9.ai`), or the endpoint you provide via `--mem9-base-url`.
+4. Chooses a mem9 isolation strategy via `--mem9-isolation`:
    - `tenant` (default): provisions a fresh mem9 space per case (strong isolation; recommended).
    - `clear`: provisions one mem9 space for the run and clears memories before/after each case.
-5. Chooses a mem9 history load strategy via `MRNIAH_MEM9_LOAD_METHOD`:
+5. Chooses a mem9 history load strategy via `--mem9-load-method`:
    - `line-write` (default): replays the transcript by posting each JSONL message line to `v1alpha2 /memories` sequentially.
    - `import-session`: uploads the full transcript via `v1alpha1 /imports` (`file_type=session`) and polls the task.
 6. Installs the `openclaw-plugin` into the memory profile, adds `plugins.allow=["mem9"]`, and writes the tenant credentials into `plugins.entries.mem9.config`.
 7. Calls `run_batch.py` twice (baseline vs mem), writing into `results-${profile}` for baseline and `results-${mem_profile}` for the mem run.
 8. Prints accuracy for both runs and the delta.
 
-Common environment variables:
+Key flags for reproducibility:
 
-| Variable                   | Default                                       | Purpose                                                         |
-| -------------------------- | --------------------------------------------- | --------------------------------------------------------------- |
-| `MRNIAH_BASE_PROFILE`      | `mrniah_local`                                | Baseline OpenClaw profile.                                      |
-| `MRNIAH_MEM_PROFILE`       | `mrniah_mem`                                  | Copy of the baseline with mem9 enabled.                         |
-| `MRNIAH_AGENT`             | `main`                                        | Agent passed through to `run_batch.py`.                         |
-| `SAMPLE_LIMIT`             | `300`                                         | Samples processed per run (alias: `MRNIAH_LIMIT`).              |
-| `MEM9_BASE_URL`            | `https://api.mem9.ai`                         | mem9 API endpoint used for the comparison run.                  |
-| `MRNIAH_MEM9_ISOLATION`    | `tenant`                                      | mem9 isolation strategy for the mem profile (`tenant` or `clear`). |
-| `MRNIAH_MEM9_LOAD_METHOD`  | `line-write`                                  | mem9 history load strategy for the mem run (`line-write` or `import-session`). |
-| `MRNIAH_MEM9_LINE_WRITE_SLEEP_MS` | `0`                                     | Sleep N ms after each v1alpha2 `/memories` write when `MRNIAH_MEM9_LOAD_METHOD=line-write`. |
-| `MRNIAH_MEM9_LINE_WRITE_VERIFY_TIMEOUT` | `20`                               | Seconds to wait for v1alpha2 recall to observe the written session lines when `MRNIAH_MEM9_LOAD_METHOD=line-write`. |
-| `MRNIAH_MEM9_LINE_WRITE_VERIFY_INTERVAL` | `0.5`                             | Polling interval seconds for write verification when `MRNIAH_MEM9_LOAD_METHOD=line-write`. |
-| `MRNIAH_PARALLEL_RUNS`     | `1`                                           | Set to `0` to run baseline + mem sequentially (more stable; lower API pressure). |
-| `MRNIAH_MEM9_TRACE_LIMIT`  | `5`                                           | Max memories to print per mem9 trace section during the mem run. |
-| `MRNIAH_MEM9_TRACE_CHARS`  | `220`                                         | Max chars per memory content preview in mem9 traces. |
-| `MRNIAH_MEM9_TRACE_QUERY_CHARS` | `800`                                     | Max chars from the question used for mem9 recall preview query. |
-| `MRNIAH_RESET_MEM_PROFILE` | `0`                                           | Set to `1` to recreate the mem profile from the base profile.   |
-| `MRNIAH_CLEAN_SESSIONS`    | `1`                                           | Set to `0` to skip cleaning prior benchmark sessions.           |
-| `MRNIAH_WIPE_AGENT_SESSIONS` | `1`                                         | Set to `0` to avoid wiping `<profile>/agents/<agent>/sessions/` before/after the run (default archives sessions into `results-logs/raw/`). |
-| `MRNIAH_WIPE_LOCAL_MEMORY`  | `1`                                           | Set to `0` to skip wiping the OpenClaw profile's local persistent memory store (`~/.openclaw-<profile>/memory/*`) between cases. |
-| `MRNIAH_OPENCLAW_TIMEOUT`  | `0`                                           | If set, passes `--timeout` to `openclaw agent` via `run_batch`. |
+- `--base-profile` / `--mem-profile` / `--agent` / `--limit`
+- `--mem9-base-url` / `--mem9-isolation` / `--mem9-load-method`
+- `--mem9-line-write-*` and `--mem9-import-*` (depending on load method)
+- `--mem9-trace-*`
+- `--parallel` / `--sequential`
+- `--openclaw-timeout`
+- `--reset-mem-profile`
 
 Workspace note:
 
@@ -146,4 +199,4 @@ python3 score.py [results/predictions.jsonl] [--max-errors 5]
 
 - Regenerating transcripts is safe—`mr-niah-transcript.py` deletes and recreates `output/` on every run.
 - If OpenClaw logs include ANSI escape sequences, `run_batch.py` strips them before parsing JSON. Check `results/raw/*.stderr.txt` when a session fails.
-- If the hosted mem9 API rejects provisioning or rate-limits requests, wait a bit and rerun, or point `MEM9_BASE_URL` to another mem9-compatible endpoint.
+- If the hosted mem9 API rejects provisioning or rate-limits requests, wait a bit and rerun, or point `--mem9-base-url` to another mem9-compatible endpoint.

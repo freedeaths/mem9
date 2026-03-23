@@ -1217,6 +1217,11 @@ def wipe_profile_local_memory(paths: StorePaths) -> Dict[str, Any]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--output-dir",
+        default="",
+        help="Directory containing MR-NIAH generated transcripts (expects <dir>/index.jsonl and <dir>/sessions/*.jsonl). Default: benchmark/MR-NIAH/output/",
+    )
     ap.add_argument("--profile", default="mrniah_local")
     ap.add_argument("--agent", default="main")
     ap.add_argument("--limit", type=int, default=30)
@@ -1228,7 +1233,11 @@ def main() -> int:
     )
     group = ap.add_mutually_exclusive_group()
     group.add_argument("--reset", action="store_true", help="Prefix each question with /reset")
-    group.add_argument("--new", action="store_true", help="Prefix each question with /new")
+    group.add_argument(
+        "--new",
+        action="store_true",
+        help="Prefix each question with /new",
+    )
     ap.add_argument(
         "--compaction-summary-max-chars",
         type=int,
@@ -1362,8 +1371,19 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    if not INDEX.exists():
-        raise SystemExit(f"Missing {INDEX}. Run mr-niah-transcript.py first.")
+    output_dir = (args.output_dir or "").strip()
+    if output_dir:
+        p = Path(output_dir).expanduser()
+        if not p.is_absolute():
+            p = (HERE / p)
+        output_path = p.resolve()
+    else:
+        output_path = OUTPUT
+    index_path = output_path / "index.jsonl"
+    sess_out = output_path / "sessions"
+
+    if not index_path.exists():
+        raise SystemExit(f"Missing {index_path}. Run mr-niah-transcript.py first (or pass --output-dir).")
 
     results_dir = (
         Path(args.results_dir).expanduser()
@@ -1419,13 +1439,13 @@ def main() -> int:
 
     if args.case_id is not None and int(args.case_id) >= 0:
         # Single-case runs should ignore --limit so any id can be rerun.
-        index_entries = load_index(INDEX)
+        index_entries = load_index(index_path)
         wanted = int(args.case_id)
         index_entries = [e for e in index_entries if _coerce_int(e.get("id")) == wanted]
         if not index_entries:
-            raise SystemExit(f"ERROR: --case-id={wanted} not found in {INDEX}.")
+            raise SystemExit(f"ERROR: --case-id={wanted} not found in {index_path}.")
     else:
-        index_entries = load_index(INDEX)[: args.limit]
+        index_entries = load_index(index_path)[: args.limit]
 
     pred_path = results_dir / "predictions.jsonl"
     resume_from = int(args.resume) if args.resume is not None else -1
@@ -1491,7 +1511,7 @@ def main() -> int:
                     raise RuntimeError(f"wipe local memory failed: {local_memory_wipe!r}")
 
             stage = "prepare_session"
-            src = SESS_OUT / f"{session_id}.jsonl"
+            src = sess_out / f"{session_id}.jsonl"
             if not src.exists():
                 raise FileNotFoundError(f"Missing generated session: {src}")
 
